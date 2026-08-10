@@ -1,6 +1,7 @@
 import type * as AST from '../../parser/ast.js';
 import type { PlanningContext } from '../planning-context.js';
 import { LiteralNode, BinaryOpNode, UnaryOpNode, CaseExprNode, CastNode, CollateNode, BetweenNode } from '../nodes/scalar.js';
+import { insertCrossTypeCoercion, coerceComparisonSet } from './coercion.js';
 import { ScalarSubqueryNode, InNode, ExistsNode } from '../nodes/subquery.js';
 import { WindowFunctionCallNode } from '../nodes/window-function.js';
 import type { ScalarPlanNode, RelationalPlanNode } from '../nodes/plan-node.js';
@@ -8,11 +9,44 @@ import { QuereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { RelationType } from '../../common/datatype.js';
 import { resolveColumn, resolveParameter } from '../resolve.js';
-import { Ambiguous } from '../scopes/scope.js';
-import { buildSelectStmt } from './select.js';
+import { Ambiguous, type Scope } from '../scopes/scope.js';
+import { buildSelectStmt, buildValuesStmt } from './select.js';
+import { buildInsertStmt } from './insert.js';
+import { buildUpdateStmt } from './update.js';
+import { buildDeleteStmt } from './delete.js';
 import { resolveWindowFunction } from '../../schema/window-function.js';
 import { buildFunctionCall } from './function-call.js';
 import { createLogger } from '../../common/logger.js';
+
+/**
+ * Plans a `QueryExpr` in scalar / IN / EXISTS expression position.
+ *
+ * SELECT and VALUES legs lower to their normal relational builders. DML
+ * legs (INSERT/UPDATE/DELETE with RETURNING — the parser requires RETURNING
+ * in this position) build through the standard DML builders and yield a
+ * `ReturningNode`. The runtime emitters for scalar / IN / EXISTS detect a
+ * side-effecting inner via `subtreeHasSideEffects` and apply full-drain +
+ * run-once semantics (see `docs/runtime.md`).
+ */
+function buildExpressionPositionQueryExpr(
+	ctx: PlanningContext,
+	query: AST.QueryExpr,
+	preserveInputColumns: boolean,
+	_siteLabel: 'scalar subquery' | 'IN subquery' | 'EXISTS subquery',
+): RelationalPlanNode {
+	switch (query.type) {
+		case 'select':
+			return buildSelectStmt(ctx, query, ctx.cteNodes, preserveInputColumns) as RelationalPlanNode;
+		case 'values':
+			return buildValuesStmt(ctx, query);
+		case 'insert':
+			return buildInsertStmt(ctx, query) as RelationalPlanNode;
+		case 'update':
+			return buildUpdateStmt(ctx, query) as RelationalPlanNode;
+		case 'delete':
+			return buildDeleteStmt(ctx, query) as RelationalPlanNode;
+	}
+}
 
 const logger = createLogger('planner:expression');
 
@@ -20,47 +54,29 @@ const logger = createLogger('planner:expression');
 const COMPARISON_OPS = new Set(['=', '==', '!=', '<>', '<', '<=', '>', '>=']);
 
 /**
- * If one operand is numeric and the other is textual, wrap the textual operand
- * in a CastNode targeting the numeric side's type name (e.g. 'INTEGER' or 'REAL').
- * Returns `[left, right]` — possibly with one side replaced by a CastNode.
+ * Build a comparison `BinaryOpNode` the ONE way every comparison site must: insert
+ * the cross-type coercion casts (so a numeric side and a textual side compare
+ * numerically, an object side and a textual side structurally), then force
+ * `generateType`'s lazily-cached collation-lattice validation so an ambiguous
+ * collation errors at prepare time rather than as the emitter's backstop.
+ *
+ * `expression` is the source spelling and is deliberately NOT rewritten to match a
+ * coerced operand — EXPLAIN keeps showing what the user wrote.
+ *
+ * Callers: the `binary` case below, and `buildUsingCondition` (`./select.ts`), which
+ * desugars `using (c)` into this node — that shared construction is what keeps a
+ * USING pair from drifting away from the spelled-out `l.c = r.c`.
  */
-function insertCrossTypeCoercion(
-	scope: import('../scopes/scope.js').Scope,
+export function buildComparison(
+	scope: Scope,
+	expression: AST.BinaryExpr,
 	left: ScalarPlanNode,
 	right: ScalarPlanNode,
-): [ScalarPlanNode, ScalarPlanNode] {
-	const leftLogical = left.getType().logicalType;
-	const rightLogical = right.getType().logicalType;
-
-	const leftNumeric = !!leftLogical.isNumeric;
-	const rightNumeric = !!rightLogical.isNumeric;
-	const leftTextual = !!leftLogical.isTextual;
-	const rightTextual = !!rightLogical.isTextual;
-
-	if (leftNumeric && rightTextual) {
-		// Wrap right (textual) in a cast to the left's numeric type
-		return [left, wrapInCast(scope, right, leftLogical.name)];
-	}
-	if (rightNumeric && leftTextual) {
-		// Wrap left (textual) in a cast to the right's numeric type
-		return [wrapInCast(scope, left, rightLogical.name), right];
-	}
-	return [left, right];
-}
-
-/** Create a synthetic CastNode wrapping `operand` with the given target type name. */
-function wrapInCast(
-	scope: import('../scopes/scope.js').Scope,
-	operand: ScalarPlanNode,
-	targetType: string,
-): CastNode {
-	// Synthesise a minimal AST.CastExpr — only `targetType` is used by the emitter.
-	const syntheticExpr: AST.CastExpr = {
-		type: 'cast',
-		expr: { type: 'literal', value: null } as AST.LiteralExpr, // placeholder
-		targetType,
-	};
-	return new CastNode(scope, syntheticExpr, operand);
+): BinaryOpNode {
+	const [coercedLeft, coercedRight] = insertCrossTypeCoercion(scope, left, right);
+	const node = new BinaryOpNode(scope, expression, coercedLeft, coercedRight);
+	node.getType();
+	return node;
 }
 
 /**
@@ -115,25 +131,32 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
 		}
 
 		case 'binary': {
-      let left = buildExpression(ctx, expr.left, allowAggregates);
-      let right = buildExpression(ctx, expr.right, allowAggregates);
-      // For comparison operators, insert explicit casts when one side is
-      // numeric and the other textual so the runtime can use the fast path.
-      if (COMPARISON_OPS.has(expr.operator)) {
-        [left, right] = insertCrossTypeCoercion(ctx.scope, left, right);
-      }
-      return new BinaryOpNode(ctx.scope, expr, left, right);
+      const left = buildExpression(ctx, expr.left, allowAggregates);
+      const right = buildExpression(ctx, expr.right, allowAggregates);
+      return COMPARISON_OPS.has(expr.operator)
+        ? buildComparison(ctx.scope, expr, left, right)
+        : new BinaryOpNode(ctx.scope, expr, left, right);
 		}
 
     case 'case': {
       // Build base expression if present
-      const baseExpr = expr.baseExpr ? buildExpression(ctx, expr.baseExpr, allowAggregates) : undefined;
+      let baseExpr = expr.baseExpr ? buildExpression(ctx, expr.baseExpr, allowAggregates) : undefined;
 
       // Build WHEN/THEN clauses
       const whenThenClauses = expr.whenThenClauses.map(clause => ({
         when: buildExpression(ctx, clause.when, allowAggregates),
         then: buildExpression(ctx, clause.then, allowAggregates)
       }));
+
+      // A simple CASE compares its base against every WHEN, so it needs the same
+      // object-physical reconciliation an IN list gets — otherwise
+      // `case json_col when '{"a":1}'` disagrees with `json_col = '{"a":1}'`.
+      if (baseExpr) {
+        const [coercedBase, coercedWhens] = coerceComparisonSet(
+          ctx.scope, baseExpr, whenThenClauses.map(c => c.when));
+        baseExpr = coercedBase;
+        coercedWhens.forEach((when, i) => { whenThenClauses[i].when = when; });
+      }
 
       // Build ELSE expression if present
       const elseExpr = expr.elseExpr ? buildExpression(ctx, expr.elseExpr, allowAggregates) : undefined;
@@ -164,17 +187,14 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
        };
        // Preserve input columns in scalar subqueries to ensure correlated predicates
        // have access to all underlying attributes.
-       const subqueryPlan = buildSelectStmt(subqueryContext, expr.query, ctx.cteNodes, true);
+       const subqueryPlan = buildExpressionPositionQueryExpr(subqueryContext, expr.query, true, 'scalar subquery');
        logger(`Building scalar subquery with preserveInputColumns=true`);
-       if (subqueryPlan.getType().typeClass !== 'relation') {
-         throw new QuereusError('Subquery must produce a relation', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
-       }
        // Validate that scalar subquery returns exactly one column
        const scalarSubqueryType = subqueryPlan.getType();
        if (scalarSubqueryType.typeClass === 'relation' && (scalarSubqueryType as RelationType).columns.length !== 1) {
          throw new QuereusError('Scalar subquery must return exactly one column', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
        }
-       return new ScalarSubqueryNode(ctx.scope, expr, subqueryPlan as RelationalPlanNode);
+       return new ScalarSubqueryNode(ctx.scope, expr, subqueryPlan);
 		}
 
 		case 'windowFunction': {
@@ -196,11 +216,22 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
          throw new QuereusError(`Window function ${expr.function.name} requires ORDER BY clause`, StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
        }
 
+       // Build the argument expressions to derive their logical types. The
+       // authoritative argument plan nodes are (re)built in select-window.ts for
+       // the WindowNode; these exist only so this node's getType() can consult
+       // inferReturnType (e.g. min(text_col) over (...) must type as TEXT so a
+       // surrounding `|| 'x'` types correctly).
+       const windowArgTypes = expr.function.args.map(arg =>
+         buildExpression(ctx, arg, false).getType().logicalType
+       );
+
        return new WindowFunctionCallNode(
          ctx.scope,
          expr,
          expr.function.name,
-         expr.function.distinct ?? false
+         expr.function.distinct ?? false,
+         undefined,
+         windowArgTypes
        );
 		}
 
@@ -209,27 +240,30 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
        const leftExpr = buildExpression(ctx, expr.expr, allowAggregates);
 
        if (expr.subquery) {
-         // IN subquery: expr IN (SELECT ...)
+         // IN subquery: expr IN (<QueryExpr>)
          const inSubqueryContext = {
            ...ctx,
            cteReferenceCache: ctx.cteReferenceCache || new Map()
          };
-         const inSubqueryPlan = buildSelectStmt(inSubqueryContext, expr.subquery, ctx.cteNodes, true);
-         if (inSubqueryPlan.getType().typeClass !== 'relation') {
-           throw new QuereusError('IN subquery must produce a relation', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
-         }
+         const inSubqueryPlan = buildExpressionPositionQueryExpr(inSubqueryContext, expr.subquery, true, 'IN subquery');
          // Validate that subquery returns exactly one column
          const subqueryType = inSubqueryPlan.getType();
          if (subqueryType.typeClass === 'relation' && (subqueryType as RelationType).columns.length !== 1) {
            throw new QuereusError('IN subquery must return exactly one column', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
          }
-                   return new InNode(ctx.scope, expr, leftExpr, inSubqueryPlan as RelationalPlanNode);
+                   const inSubqueryNode = new InNode(ctx.scope, expr, leftExpr, inSubqueryPlan);
+                   // Force the lazily-cached generateType so a collation-lattice
+                   // conflict errors at prepare time, not first emit.
+                   inSubqueryNode.getType();
+                   return inSubqueryNode;
                } else if (expr.values) {
           // IN value list: expr IN (value1, value2, ...)
-          const valueExprs = expr.values.map(val => buildExpression(ctx, val, allowAggregates));
-          // Create a special IN node for value lists
-          // Import the InNode from subquery module
-          return new InNode(ctx.scope, expr, leftExpr, undefined, valueExprs);
+          const rawValueExprs = expr.values.map(val => buildExpression(ctx, val, allowAggregates));
+          const [inLeft, valueExprs] = coerceComparisonSet(ctx.scope, leftExpr, rawValueExprs);
+          const inListNode = new InNode(ctx.scope, expr, inLeft, undefined, valueExprs);
+          // Same eager collation-lattice validation as the subquery form.
+          inListNode.getType();
+          return inListNode;
        } else {
          throw new QuereusError('IN expression must have either values or subquery', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
        }
@@ -241,11 +275,8 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
          ...ctx,
          cteReferenceCache: ctx.cteReferenceCache || new Map()
        };
-       const existsSubqueryPlan = buildSelectStmt(existsSubqueryContext, expr.subquery, ctx.cteNodes, true);
-       if (existsSubqueryPlan.getType().typeClass !== 'relation') {
-         throw new QuereusError('EXISTS subquery must produce a relation', StatusCode.ERROR, undefined, expr.loc?.start.line, expr.loc?.start.column);
-       }
-       return new ExistsNode(ctx.scope, expr, existsSubqueryPlan as RelationalPlanNode);
+       const existsSubqueryPlan = buildExpressionPositionQueryExpr(existsSubqueryContext, expr.subquery, true, 'EXISTS subquery');
+       return new ExistsNode(ctx.scope, expr, existsSubqueryPlan);
 		}
 
     case 'between': {
@@ -256,7 +287,11 @@ export function buildExpression(ctx: PlanningContext, expr: AST.Expression, allo
        // Insert explicit casts for cross-category operands (same logic as comparisons)
        [exprNode, lowerNode] = insertCrossTypeCoercion(ctx.scope, exprNode, lowerNode);
        [exprNode, upperNode] = insertCrossTypeCoercion(ctx.scope, exprNode, upperNode);
-       return new BetweenNode(ctx.scope, expr, exprNode, lowerNode, upperNode);
+       const betweenNode = new BetweenNode(ctx.scope, expr, exprNode, lowerNode, upperNode);
+       // Force the lazily-cached generateType so a per-bound collation-lattice
+       // conflict errors at prepare time.
+       betweenNode.getType();
+       return betweenNode;
 		}
 
 		default:

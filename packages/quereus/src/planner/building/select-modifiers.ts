@@ -12,6 +12,7 @@ import { RegisteredScope } from '../scopes/registered.js';
 import { ColumnReferenceNode } from '../nodes/reference.js';
 import { buildExpression } from './expression.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
+import { buildOrdinalAwareExpression, resolveOrdinalOutputColumn, type SelectListEntry } from './select-ordinal.js';
 
 /**
  * Creates final output projections and applies result column aliases
@@ -22,7 +23,8 @@ export function buildFinalProjections(
 	selectScope: Scope,
 	stmt: AST.SelectStmt,
 	selectContext: PlanningContext,
-	preserveInputColumns: boolean = true
+	preserveInputColumns: boolean = true,
+	selectList: readonly SelectListEntry[] = []
 ): {
 	output: RelationalPlanNode;
 	finalContext: PlanningContext;
@@ -46,9 +48,11 @@ export function buildFinalProjections(
 	let currentInput = input;
 
 	// Apply ORDER BY before projection if needed (compile expressions against input scope)
+	// This sort sits BELOW the projection, so there are no output attributes to bind a
+	// positional ORDER BY reference to — ordinals resolve through the select list instead.
 	if (needsPreProjectionSort && stmt.orderBy && stmt.orderBy.length > 0) {
 		const sortKeys: SortKey[] = stmt.orderBy.map(orderByClause => {
-			const expression = buildExpression(selectContext, orderByClause.expr);
+			const expression = buildOrdinalAwareExpression(selectContext, orderByClause.expr, selectList, 'ORDER BY');
 			return {
 				expression,
 				direction: orderByClause.direction,
@@ -89,14 +93,23 @@ export function applyDistinct(
 }
 
 /**
- * Applies ORDER BY clause if not already applied
+ * Applies ORDER BY clause if not already applied.
+ *
+ * `outputRelation`, when supplied, is the node whose output attributes ARE this
+ * SELECT's result columns (the final `ProjectNode`, or the source itself for an
+ * identity `select *`). A positional ORDER BY reference then binds to output
+ * position N directly — see {@link resolveOrdinalOutputColumn}. The sort this
+ * builds sits ABOVE that relation, so the reference resolves at runtime.
  */
 export function applyOrderBy(
 	input: RelationalPlanNode,
 	stmt: AST.SelectStmt,
 	selectContext: PlanningContext,
 	preAggregateSort: boolean,
-	projectionScope?: RegisteredScope
+	projectionScope?: RegisteredScope,
+	allowAggregates: boolean = false,
+	selectList: readonly SelectListEntry[] = [],
+	outputRelation?: RelationalPlanNode
 ): RelationalPlanNode {
 	if (stmt.orderBy && stmt.orderBy.length > 0 && !preAggregateSort) {
 		// Merge projection scope if available so ORDER BY can reference output column aliases
@@ -106,8 +119,24 @@ export function applyOrderBy(
 			orderByContext = { ...selectContext, scope: combinedScope };
 		}
 
+		// Alignment guard: bind by output position only when the relation really does
+		// publish one attribute per SELECT-list column. The grouped path may skip its
+		// final projection when the AggregateNode's own output already IS the select
+		// list, in which case the relation advertises every grouping key it computes —
+		// more columns than the select list names, so positional binding would hand
+		// back the wrong column. That shape keeps the select-list fallback below.
+		// (The window path DOES publish one attribute per select-list column, stars
+		// included, so it binds positionally.)
+		const alignedOutput = outputRelation && outputRelation.getAttributes().length === selectList.length
+			? outputRelation
+			: undefined;
+
 		const sortKeys: SortKey[] = stmt.orderBy.map(orderByClause => {
-			const expression = buildExpression(orderByContext, orderByClause.expr);
+			const positional = alignedOutput
+				? resolveOrdinalOutputColumn(orderByClause.expr, alignedOutput, orderByContext.scope)
+				: null;
+			const expression = positional
+				?? buildOrdinalAwareExpression(orderByContext, orderByClause.expr, selectList, 'ORDER BY', allowAggregates);
 			return {
 				expression,
 				direction: orderByClause.direction,
@@ -177,7 +206,7 @@ function shouldApplyOrderByBeforeProjection(
 /**
  * Creates a scope for projection output columns
  */
-function createProjectionOutputScope(projectionNode: RelationalPlanNode): RegisteredScope {
+export function createProjectionOutputScope(projectionNode: RelationalPlanNode): RegisteredScope {
 	const projectionOutputScope = new RegisteredScope();
 	const projectionAttributes = projectionNode.getAttributes();
 
@@ -202,6 +231,26 @@ function isIdentityProjection(projections: Projection[], source: RelationalPlanN
 	// Must have same number of projections as source attributes
 	if (projections.length !== sourceAttrs.length) {
 		return false;
+	}
+
+	// A `with inverse` clause rides the ProjectNode's projections into the update
+	// lineage — skipping the node would silently drop the authored puts (e.g.
+	// `select code with inverse (code = upper(new.code)) from t`).
+	if (projections.some(p => p.authoredInverse)) {
+		return false;
+	}
+
+	// If the source exposes duplicate column names (e.g., a JOIN with same-named
+	// columns on each side), a ProjectNode is required to disambiguate via
+	// `name:N` suffixes — otherwise downstream row→object conversion would
+	// collapse duplicate keys and silently drop columns.
+	const seenNames = new Set<string>();
+	for (const attr of sourceAttrs) {
+		const lower = attr.name.toLowerCase();
+		if (seenNames.has(lower)) {
+			return false;
+		}
+		seenNames.add(lower);
 	}
 
 	for (let i = 0; i < projections.length; i++) {

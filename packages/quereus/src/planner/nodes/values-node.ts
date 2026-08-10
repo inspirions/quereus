@@ -1,10 +1,11 @@
 import type { RelationType } from '../../common/datatype.js';
 import type { Scope } from '../scopes/scope.js';
-import { PlanNode, type ScalarPlanNode, type ZeroAryRelationalNode, type Attribute } from './plan-node.js';
+import { PlanNode, type ScalarPlanNode, type ZeroAryRelationalNode, type Attribute, type PhysicalProperties } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import { Cached } from '../../util/cached.js';
 import { formatScalarType } from '../../util/plan-formatter.js';
 import { Row } from '../../common/types.js';
+import { addSingletonFd } from '../util/fd-utils.js';
 
 /**
  * Represents a VALUES clause, producing a relation from literal rows.
@@ -98,6 +99,19 @@ export class ValuesNode extends PlanNode implements ZeroAryRelationalNode {
 
   getRelations(): readonly [] {
     return [];
+  }
+
+  computePhysical(_children: readonly PhysicalProperties[]): Partial<PhysicalProperties> {
+    // A VALUES clause with ≤1 row is provably ≤1-row, so emit the canonical
+    // singleton `∅ → all_cols` FD. Multi-row VALUES remains a bag with no FDs.
+    if (this.rows.length > 1) {
+      return { estimatedRows: this.rows.length };
+    }
+    const fds = addSingletonFd([], this.getAttributes().length);
+    return {
+      estimatedRows: this.rows.length,
+      fds: fds.length > 0 ? fds : undefined,
+    };
   }
 
   withChildren(newChildren: readonly PlanNode[]): PlanNode {
@@ -223,6 +237,20 @@ export class TableLiteralNode extends PlanNode implements ZeroAryRelationalNode 
 
 	getRelations(): readonly [] {
 		return [];
+	}
+
+	computePhysical(): Partial<PhysicalProperties> {
+		// Const-folding preserves the source's logical `type` (declared keys + isSet)
+		// but drops its physical FDs. A ≤1-row literal therefore keeps the declared
+		// empty key with no matching `∅ → all_cols` FD unless we re-emit it here —
+		// the same independent-channel drift the leaf ≤1-row producers reconcile.
+		// Detect ≤1-row via the materialized row count (mirrors `ValuesNode`).
+		const colCount = this.getType().columns.length;
+		if (this.rowCount !== undefined && this.rowCount <= 1) {
+			const fds = addSingletonFd([], colCount);
+			return { estimatedRows: this.rowCount, fds: fds.length > 0 ? fds : undefined };
+		}
+		return { estimatedRows: this.rowCount };
 	}
 
 	withChildren(newChildren: readonly PlanNode[]): PlanNode {

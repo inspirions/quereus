@@ -47,7 +47,7 @@ CREATE TABLE t_parse_empty ();
 
 -- DROP with unsupported object type
 DROP TRIGGER some_trigger;
--- error: Expected TABLE, VIEW, INDEX, or ASSERTION after DROP
+-- error: Expected TABLE, VIEW, MATERIALIZED VIEW, INDEX, or ASSERTION after DROP
 
 -- Incomplete CASE expression
 SELECT CASE WHEN 1 THEN 2;
@@ -61,3 +61,17 @@ SELECT * FROM t_parse_where WHERE;
 -- error: Expected expression
 
 DROP TABLE t_parse_where;
+-- run
+
+-- @-prefixed parameter form (not supported in Quereus; lexer rejects)
+SELECT 1 WHERE 1 = @x;
+-- error: Unexpected character
+
+-- ?-followed-by-digit (sqlite ?N form not supported; ? is consumed
+-- as positional placeholder, leaving the digit as a stray token)
+SELECT 1 WHERE 1 = ?1;
+-- error:
+
+-- Named parameter prefix with neither identifier nor integer
+SELECT :;
+-- error: Expected identifier or number after parameter prefix

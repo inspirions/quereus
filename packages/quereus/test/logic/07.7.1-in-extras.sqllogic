@@ -1,0 +1,158 @@
+-- adapted from SQLite test/in.test, test/in2.test, test/in4.test, test/in5.test
+-- IN operator surface gaps: row-value (tuple) IN with literal list and subquery,
+-- IN with extra parens around subquery, IN with CASE expression as operand,
+-- DML with IN-subquery filters, and IN list with duplicate values.
+
+create table inx_t (id integer primary key, a integer, b integer);
+insert into inx_t values (1, 1, 10), (2, 2, 20), (3, 3, 30), (4, 4, 40);
+
+-- =============================================================================
+-- Row-value (tuple) IN with literal list — Quereus parser does not support
+-- row-value tuple syntax in IN; convert to error assertion.
+-- =============================================================================
+
+select id from inx_t where (a, b) in ((1, 10), (3, 30), (99, 99)) order by id;
+-- error: Expected ')'
+
+-- =============================================================================
+-- IN with extra parens around subquery: Quereus interprets extra parens as
+-- forcing scalar context, so a multi-row subquery becomes a scalar-error case.
+-- These do not apply.
+-- =============================================================================
+
+-- =============================================================================
+-- IN with CASE expression as operand
+-- =============================================================================
+
+select id, (case when a > 2 then a else a + 100 end) in (101, 102, 3, 4) as matched from inx_t order by id;
+→ [{"id":1,"matched":true},{"id":2,"matched":true},{"id":3,"matched":true},{"id":4,"matched":true}]
+
+-- IN where the list contains expressions
+select id from inx_t where a in (1 + 1, 1 + 2) order by id;
+→ [{"id":2},{"id":3}]
+
+-- =============================================================================
+-- IN list with duplicate values (must dedupe — should not change result)
+-- =============================================================================
+
+select id from inx_t where a in (1, 1, 2, 2, 1) order by id;
+→ [{"id":1},{"id":2}]
+
+-- =============================================================================
+-- UPDATE / DELETE with IN-subquery filter
+-- =============================================================================
+
+create table inx_dml (id integer primary key, val integer);
+insert into inx_dml values (1, 10), (2, 20), (3, 30), (4, 40);
+
+create table inx_keep (id integer primary key);
+insert into inx_keep values (1), (3);
+
+-- UPDATE WHERE id IN (subquery)
+update inx_dml set val = val * 10 where id in (select id from inx_keep);
+select id, val from inx_dml order by id;
+→ [{"id":1,"val":100},{"id":2,"val":20},{"id":3,"val":300},{"id":4,"val":40}]
+
+-- DELETE WHERE id NOT IN (subquery)
+delete from inx_dml where id not in (select id from inx_keep);
+select id, val from inx_dml order by id;
+→ [{"id":1,"val":100},{"id":3,"val":300}]
+
+drop table inx_dml;
+drop table inx_keep;
+
+-- =============================================================================
+-- Single-placeholder `col in (?)` over a PK must match exactly the bound row(s),
+-- never the whole table. Regression for the match-all defect: a one-element
+-- parameterized IN reduced to a point-seek on Literal(undefined) and degraded to
+-- a full-index walk, so `delete from T where pk in (?)` wiped every row.
+-- See quereus-single-element-in-list-matches-all.
+-- =============================================================================
+
+create table inp (id integer primary key, label text);
+insert into inp values (0, 'a'), (1, 'b'), (2, 'c'), (3, 'd');
+
+-- select with a single placeholder matches just the bound row
+-- params: [1]
+select id from inp where id in (?) order by id;
+→ [{"id":1}]
+
+-- a different bind value selects a different single row
+-- params: [2]
+select id from inp where id in (?) order by id;
+→ [{"id":2}]
+
+-- one-, two-, three-placeholder IN agree, and with `= ?`
+-- params: [1, 2]
+select id from inp where id in (?, ?) order by id;
+→ [{"id":1},{"id":2}]
+
+-- params: [0, 2, 3]
+select id from inp where id in (?, ?, ?) order by id;
+→ [{"id":0},{"id":2},{"id":3}]
+
+-- params: [3]
+select id from inp where id = ? order by id;
+→ [{"id":3}]
+
+-- Correlated single-element IN (`p.id in (outer.target)`) — the inner scalar
+-- subquery seeks inp's PK on a correlated outer column. Pre-fix this match-alled,
+-- so the scalar subquery would have seen every row instead of exactly one.
+create table inref (rid integer primary key, target integer);
+insert into inref values (10, 2), (11, 3);
+select o.rid, (select p.label from inp p where p.id in (o.target)) as label from inref o order by o.rid;
+→ [{"rid":10,"label":"c"},{"rid":11,"label":"d"}]
+
+-- Plan-mechanism guard: the single-placeholder IN must reduce to an index seek
+-- whose seek key is the bound ParameterReference — NOT a Literal(undefined). The
+-- defect emitted a Literal node (value undefined) as the seek key, which the scan
+-- layer read as "no constraint" and walked the whole index.
+select count(*) as params from query_plan('select id from inp where id in (?)') where node_type = 'ParameterReference';
+→ [{"params":1}]
+
+select count(*) as lits from query_plan('select id from inp where id in (?)') where node_type = 'Literal';
+→ [{"lits":0}]
+
+-- DESTRUCTIVE: delete with a single placeholder removes ONLY the bound row,
+-- not the whole table.
+-- params: [1]
+delete from inp where id in (?);
+→ []
+
+select id from inp order by id;
+→ [{"id":0},{"id":2},{"id":3}]
+
+-- Composite multi-column seek with a single-element dynamic IN component.
+-- A 2-column PK seek where one column carries a multi-value IN (`a in (1, 2)`)
+-- and the other a single-placeholder IN (`b in (?)`) takes the composite
+-- cross-product seek path. Pre-fix the single-element component was dropped to
+-- Literal(undefined) (match-all on b); it must instead seek on the bound param,
+-- so only the b = <param> rows match.
+create table cmp (a integer, b integer, label text, primary key (a, b));
+insert into cmp values (1, 5, 'a'), (1, 6, 'b'), (2, 5, 'c'), (2, 6, 'd');
+
+-- b bound to 5 selects exactly the b=5 rows across both a values
+-- params: [5]
+select label from cmp where a in (1, 2) and b in (?) order by label;
+→ [{"label":"a"},{"label":"c"}]
+
+-- a different bind picks the other pair (proves the param is not constant-folded)
+-- params: [6]
+select label from cmp where a in (1, 2) and b in (?) order by label;
+→ [{"label":"b"},{"label":"d"}]
+
+-- Plan-mechanism guard: the dynamic component survives into the composite seek as
+-- the bound ParameterReference, not a dropped Literal(undefined). Pre-fix the param
+-- was lost entirely (0 ParameterReference nodes). Asserted as a presence check
+-- rather than an exact count because the seek-key cardinality is module-specific
+-- (the memory module expands the literal `a in (1, 2)` cross-product, emitting the
+-- param once per tuple; the store module keeps a single seek with one param node).
+select case when count(*) >= 1 then 'present' else 'absent' end as param from query_plan('select label from cmp where a in (1, 2) and b in (?)') where node_type = 'ParameterReference';
+→ [{"param":"present"}]
+
+drop table cmp;
+
+drop table inref;
+drop table inp;
+
+drop table inx_t;

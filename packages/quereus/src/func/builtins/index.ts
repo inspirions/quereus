@@ -1,4 +1,4 @@
-import { absFunc, roundFunc, coalesceFunc,
+import { absFunc, roundFunc1, roundFunc2, coalesceFunc,
 	nullifFunc, typeofFunc, randomFunc, randomblobFunc, iifFunc, sqrtFunc,
 	powFunc, powerFunc, floorFunc, ceilFunc, ceilingFunc,
 	clampFunc,
@@ -9,7 +9,8 @@ import { lowerFunc, upperFunc } from './string.js';
 import { lengthFunc, substrFunc, substringFunc, likeFunc, globFunc, trimFunc, ltrimFunc, rtrimFunc, replaceFunc,
 	instrFunc, lpadFunc, rpadFunc, reverseFunc,
 	stringConcatFunc,
-	splitStringFunc} from './string.js';
+	splitStringFunc,
+	hexFunc, unhexFunc} from './string.js';
 import { countStarFunc, sumFunc, avgFunc, minFunc, maxFunc, countXFunc, groupConcatFuncRev, totalFunc,
 	varPopFunc, varSampFunc, stdDevPopFunc, stdDevSampFunc } from './aggregate.js';
 import type { FunctionSchema } from '../../schema/function.js';
@@ -20,10 +21,13 @@ import { jsonValidFunc, jsonSchemaFunc, jsonTypeFunc, jsonExtractFunc, jsonQuote
 	jsonArrayLengthFunc, jsonPatchFunc,
 	jsonGroupArrayFunc, jsonGroupObjectFunc } from './json.js';
 import { generateSeriesFunc } from './generation.js';
-import { queryPlanFunc, schedulerProgramFunc, stackTraceFunc, executionTraceFunc, rowTraceFunc, explainAssertionFunc } from './explain.js';
-import { schemaFunc, tableInfoFunc, functionInfoFunc, foreignKeyInfoFunc } from './schema.js';
+import { mutationOrdinalFunc } from './mutation.js';
+import { queryPlanFunc, schedulerProgramFunc, stackTraceFunc, executionTraceFunc, rowTraceFunc, explainAssertionFunc, effectiveLensFunc, basisBackfillFunc, lensAdvisoriesFunc } from './explain.js';
+import { schemaFunc, tableInfoFunc, functionInfoFunc, foreignKeyInfoFunc,
+	indexInfoFunc, checkConstraintInfoFunc, uniqueConstraintInfoFunc, assertionInfoFunc,
+	viewInfoFunc, columnInfoFunc } from './schema.js';
 import { jsonEachFunc, jsonTreeFunc } from './json-tvf.js';
-import { INTEGER_FUNC, REAL_FUNC, TEXT_FUNC, BOOLEAN_FUNC, DATE_FUNC, TIME_FUNC, DATETIME_FUNC, JSON_FUNC, TIMESPAN_FUNC } from './conversion.js';
+import { INTEGER_FUNC, REAL_FUNC, TEXT_FUNC, BLOB_FUNC, BOOLEAN_FUNC, DATE_FUNC, TIME_FUNC, DATETIME_FUNC, JSON_FUNC, TIMESPAN_FUNC } from './conversion.js';
 import {
 	timespanYearsFunc, timespanMonthsFunc, timespanWeeksFunc, timespanDaysFunc,
 	timespanHoursFunc, timespanMinutesFunc, timespanSecondsFunc,
@@ -38,6 +42,7 @@ export const BUILTIN_FUNCTIONS: FunctionSchema[] = [
 	INTEGER_FUNC,
 	REAL_FUNC,
 	TEXT_FUNC,
+	BLOB_FUNC,
 	BOOLEAN_FUNC,
 	DATE_FUNC,
 	TIME_FUNC,
@@ -46,7 +51,8 @@ export const BUILTIN_FUNCTIONS: FunctionSchema[] = [
 	TIMESPAN_FUNC,
 	// Scalar Functions
 	absFunc,
-	roundFunc,
+	roundFunc1,
+	roundFunc2,
 	coalesceFunc,
 	nullifFunc,
 	typeofFunc,
@@ -79,6 +85,8 @@ export const BUILTIN_FUNCTIONS: FunctionSchema[] = [
 	reverseFunc,
 	lpadFunc,
 	rpadFunc,
+	hexFunc,
+	unhexFunc,
 	stringConcatFunc,
 	splitStringFunc,
 	// Aggregates
@@ -138,6 +146,8 @@ export const BUILTIN_FUNCTIONS: FunctionSchema[] = [
 	jsonGroupObjectFunc,
 	// Generation functions
 	generateSeriesFunc,
+	// Mutation-context functions
+	mutationOrdinalFunc,
 	// Explain functions
 	queryPlanFunc,
 	schedulerProgramFunc,
@@ -145,11 +155,20 @@ export const BUILTIN_FUNCTIONS: FunctionSchema[] = [
 	executionTraceFunc,
 	rowTraceFunc,
 	explainAssertionFunc,
+	effectiveLensFunc,
+	basisBackfillFunc,
+	lensAdvisoriesFunc,
 	// Schema introspection functions
 	schemaFunc,
 	tableInfoFunc,
 	functionInfoFunc,
 	foreignKeyInfoFunc,
+	indexInfoFunc,
+	checkConstraintInfoFunc,
+	uniqueConstraintInfoFunc,
+	assertionInfoFunc,
+	viewInfoFunc,
+	columnInfoFunc,
 	// JSON table-valued functions
 	jsonEachFunc,
 	jsonTreeFunc,

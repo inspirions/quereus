@@ -14,26 +14,40 @@ import { Scheduler } from "../../runtime/scheduler.js";
 import { analyzeRowSpecific } from "../../planner/analysis/constraint-extractor.js";
 import { Parser } from "../../parser/parser.js";
 import * as AST from "../../parser/ast.js";
+import { astToString } from "../../emit/ast-stringify.js";
 import { GlobalScope } from "../../planner/scopes/global.js";
 import { ParameterScope } from "../../planner/scopes/param.js";
+import { computeBasisBackfill } from "../../schema/basis-backfill.js";
+import { computeSchemaHash } from "../../schema/schema-hasher.js";
 import type { PlanningContext } from "../../planner/planning-context.js";
 import { BuildTimeDependencyTracker } from "../../planner/planning-context.js";
 import { buildBlock } from "../../planner/building/block.js";
+import { resolveBaseSite } from "../../planner/analysis/update-lineage.js";
+import type { LensSlot } from "../../schema/lens.js";
+import { createLogger } from "../../common/logger.js";
+import { splitBaseKey } from "../../util/qualified-name.js";
+
+const log = createLogger('func:builtins:explain');
+
+interface NamedSchemaLike {
+	name: string;
+	schemaName?: string;
+}
 
 // Helper function to safely get function name from nodes that have it
 function getFunctionName(node: PlanNode): string | null {
-	// Check for nodes that have functionName property
-	if ('functionName' in node && typeof (node as any).functionName === 'string') {
-		return (node as any).functionName;
+	const candidate = (node as { functionName?: unknown }).functionName;
+	if (typeof candidate === 'string') {
+		return candidate;
 	}
 	return null;
 }
 
 // Helper function to safely get alias from nodes that have it
 function getAlias(node: PlanNode): string | null {
-	// Check for nodes that have alias property
-	if ('alias' in node && typeof (node as any).alias === 'string') {
-		return (node as any).alias;
+	const candidate = (node as { alias?: unknown }).alias;
+	if (typeof candidate === 'string') {
+		return candidate;
 	}
 	return null;
 }
@@ -47,24 +61,21 @@ function getObjectName(node: PlanNode): string | null {
 	}
 
 	// Check for table schema in table reference nodes
-	if ('tableSchema' in node) {
-		const tableSchema = (node as any).tableSchema;
-		if (tableSchema && typeof tableSchema.name === 'string') {
-			return tableSchema.schemaName ? `${tableSchema.schemaName}.${tableSchema.name}` : tableSchema.name;
-		}
+	const tableSchema = (node as { tableSchema?: NamedSchemaLike }).tableSchema;
+	if (tableSchema && typeof tableSchema.name === 'string') {
+		return tableSchema.schemaName ? `${tableSchema.schemaName}.${tableSchema.name}` : tableSchema.name;
 	}
 
 	// Check for CTE name
-	if ('cteName' in node && typeof (node as any).cteName === 'string') {
-		return (node as any).cteName;
+	const cteName = (node as { cteName?: unknown }).cteName;
+	if (typeof cteName === 'string') {
+		return cteName;
 	}
 
 	// Check for view schema in view reference nodes
-	if ('viewSchema' in node) {
-		const viewSchema = (node as any).viewSchema;
-		if (viewSchema && typeof viewSchema.name === 'string') {
-			return viewSchema.schemaName ? `${viewSchema.schemaName}.${viewSchema.name}` : viewSchema.name;
-		}
+	const viewSchema = (node as { viewSchema?: NamedSchemaLike }).viewSchema;
+	if (viewSchema && typeof viewSchema.name === 'string') {
+		return viewSchema.schemaName ? `${viewSchema.schemaName}.${viewSchema.name}` : viewSchema.name;
 	}
 
 	return null;
@@ -96,7 +107,13 @@ export const queryPlanFunc = createIntegratedTableValuedFunction(
 			],
 			keys: [],
 			rowConstraints: []
-		}
+		},
+		relationalAdvertisement: {
+			isSet: true,
+			// `id` (column 0) is the assigned nodeId and is unique per plan node.
+			keys: [[{ index: 0 }]],
+			deterministic: true,
+		},
 	},
 	async function* (db: Database, sql: SqlValue): AsyncIterable<Row> {
 		if (typeof sql !== 'string') {
@@ -148,7 +165,7 @@ export const queryPlanFunc = createIntegratedTableValuedFunction(
 					// Attach minimal QuickPick diagnostics from optimizer if available
 					const diag = db.optimizer.getLastDiagnostics?.();
 					if (diag?.quickpick) {
-						(logicalAttributes as any).quickpick = diag.quickpick;
+						(logicalAttributes as Record<string, unknown>).quickpick = diag.quickpick;
 					}
 					properties = safeJsonStringify(logicalAttributes);
 				}
@@ -181,10 +198,10 @@ export const queryPlanFunc = createIntegratedTableValuedFunction(
 					nodeStack.push({ node: children[i], parentId: currentId, level });
 				}
 			}
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} catch (error: any) {
+		} catch (error: unknown) {
 			// If planning fails, yield an error row
-			yield [1, null, 0, 'ERROR', 'ERROR', `Failed to plan SQL: ${error.message}`, null, null, null, null, null, null];
+			const message = error instanceof Error ? error.message : String(error);
+			yield [1, null, 0, 'ERROR', 'ERROR', `Failed to plan SQL: ${message}`, null, null, null, null, null, null];
 		}
 	}
 );
@@ -220,8 +237,11 @@ export const schedulerProgramFunc = createIntegratedTableValuedFunction(
 			// Parse and plan the SQL to get the actual plan tree
 			const plan = db.getPlan(sql);
 
-			// Emit the plan to get the instruction tree
-			const emissionContext = new EmissionContext(db);
+			// Emit the plan to get the instruction tree. Unfused: this TVF exists to show
+			// the instruction graph, and execution_trace() joins against it by instruction
+			// index — both must report the same (full, sub-program) form. Scalar fusion
+			// would dissolve scalar sub-programs into single fused(...) instructions.
+			const emissionContext = new EmissionContext(db, { fuseScalars: false });
 			const rootInstruction = emitPlanNode(plan, emissionContext);
 
 			// Create a scheduler to get the instruction sequence
@@ -273,10 +293,10 @@ export const schedulerProgramFunc = createIntegratedTableValuedFunction(
 					}
 				}
 			}
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} catch (error: any) {
+		} catch (error: unknown) {
 			// If compilation fails, yield an error instruction
-			yield [0, '[]', `Failed to compile SQL: ${error.message}`, null, 0, null];
+			const message = error instanceof Error ? error.message : String(error);
+			yield [0, '[]', `Failed to compile SQL: ${message}`, null, 0, null];
 		}
 	}
 );
@@ -315,7 +335,7 @@ export const stackTraceFunc = createIntegratedTableValuedFunction(
 
 			// Simulate a call stack based on the plan structure
 			let frameId = 0;
-			const stack: Array<{ name: string; location: string; vars: any }> = [];
+			const stack: Array<{ name: string; location: string; vars: Record<string, unknown> }> = [];
 
 			// Add main execution frame
 			stack.push({
@@ -336,27 +356,33 @@ export const stackTraceFunc = createIntegratedTableValuedFunction(
 				if (!node || depth > 10) return; // Prevent infinite recursion
 
 				switch (node.nodeType) {
-					case 'Block':
+					case 'Block': {
+						const statements = (node as { statements?: ReadonlyArray<unknown> }).statements;
 						stack.push({
 							name: 'buildBlock',
 							location: 'building/block.ts:buildBlock',
-							vars: { statementCount: ('statements' in node) ? (node as any).statements?.length || 0 : 0 }
+							vars: { statementCount: statements?.length ?? 0 }
 						});
 						break;
-					case 'Filter':
+					}
+					case 'Filter': {
+						const condition = (node as { condition?: { toString(): string } }).condition;
 						stack.push({
 							name: 'buildFilter',
 							location: 'building/select.ts:buildSelectStmt',
-							vars: { condition: ('condition' in node) ? (node as any).condition?.toString() || 'unknown' : 'unknown' }
+							vars: { condition: condition?.toString() ?? 'unknown' }
 						});
 						break;
-					case 'Project':
+					}
+					case 'Project': {
+						const projections = (node as { projections?: ReadonlyArray<unknown> }).projections;
 						stack.push({
 							name: 'buildProject',
 							location: 'building/select.ts:buildSelectStmt',
-							vars: { projectionCount: ('projections' in node) ? (node as any).projections?.length || 0 : 0 }
+							vars: { projectionCount: projections?.length ?? 0 }
 						});
 						break;
+					}
 				}
 
 				// Recursively add frames for children
@@ -380,10 +406,10 @@ export const stackTraceFunc = createIntegratedTableValuedFunction(
 					0                            // is_virtual
 				];
 			}
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} catch (error: any) {
+		} catch (error: unknown) {
 			// If analysis fails, yield an error frame
-			yield [0, 0, 'error', 'stack_trace', `Failed to analyze: ${error.message}`, null, 0];
+			const message = error instanceof Error ? error.message : String(error);
+			yield [0, 0, 'error', 'stack_trace', `Failed to analyze: ${message}`, null, 0];
 		}
 	}
 );
@@ -433,21 +459,25 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 					instructionDependencies.set(addr, dependencies);
 					instructionOperations.set(addr, description);
 				}
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			} catch (schedulerError: any) {
-				console.warn('Could not get scheduler program info:', schedulerError.message);
+			} catch (schedulerError: unknown) {
+				const message = schedulerError instanceof Error ? schedulerError.message : String(schedulerError);
+				console.warn('Could not get scheduler program info:', message);
 			}
 
 			// Import the CollectingInstructionTracer
 			const tracer = new CollectingInstructionTracer();
 
 			// Parse the query and execute with tracing
-			let stmt: any;
+			let stmt: ReturnType<Database['prepare']> | undefined;
 			try {
 				stmt = db.prepare(sql);
+				// Trace the UNFUSED graph so instruction indices line up with the
+				// scheduler_program() rows joined above. Compile is deferred, so setting
+				// this right after prepare is race-free (see Statement._emitUnfused).
+				stmt._emitUnfused = true;
 
 				// Execute the query with tracing to collect actual instruction events
-				const results: any[] = [];
+				const results: Row[] = [];
 				for await (const row of stmt.iterateRowsWithTrace(undefined, tracer)) {
 					results.push(row); // We don't yield the results, just the trace events
 				}
@@ -491,7 +521,7 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 				}
 
 				// Build enhanced sub-program information
-				let subProgramsInfo: any = null;
+				let subProgramsInfo: unknown = null;
 				if (inputEvent?.subPrograms && inputEvent.subPrograms.length > 0) {
 					// Enhance sub-program info with details from the tracer
 					subProgramsInfo = inputEvent.subPrograms.map(sp => {
@@ -504,10 +534,10 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 
 						if (subProgramDetail) {
 							// Add instruction details from the sub-program
-							const instructions = subProgramDetail.scheduler.instructions.map((instr: any, idx: number) => ({
+							const instructions = subProgramDetail.scheduler.instructions.map((instr: Instruction, idx: number) => ({
 								index: idx,
 								operation: instr.note || `instruction_${idx}`,
-								dependencies: instr.params.map((_: any, paramIdx: number) => paramIdx).filter((paramIdx: number) => paramIdx < idx)
+								dependencies: instr.params.map((_, paramIdx) => paramIdx).filter((paramIdx) => paramIdx < idx)
 							}));
 							return { ...baseInfo, instructions };
 						}
@@ -546,9 +576,9 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 				];
 			}
 
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		} catch (error: any) {
+		} catch (error: unknown) {
 			// If tracing setup fails, yield an error event
+			const message = error instanceof Error ? error.message : String(error);
 			yield [
 				0,                                                        // instruction_index
 				'TRACE_SETUP',                                           // operation
@@ -557,7 +587,7 @@ export const executionTraceFunc = createIntegratedTableValuedFunction(
 				null,                                                     // output_value
 				null,                                                     // duration_ms
 				null,                                                     // sub_programs
-				`Failed to setup execution trace: ${error.message}`,     // error_message
+				`Failed to setup execution trace: ${message}`,           // error_message
 				Date.now()                                                // timestamp_ms
 			];
 		}
@@ -596,21 +626,21 @@ export const rowTraceFunc = createIntegratedTableValuedFunction(
 			const tracer = new CollectingInstructionTracer();
 
 			// Parse the query and execute with tracing
-			let stmt: any;
+			let stmt: ReturnType<Database['prepare']> | undefined;
 			try {
 				stmt = db.prepare(sql);
 
 				// Execute the query with tracing to collect row-level events
-				const results: any[] = [];
+				const results: Row[] = [];
 				for await (const row of stmt.iterateRowsWithTrace(undefined, tracer)) {
 					results.push(row); // We don't yield the results, just the trace events
 				}
 
 				await stmt.finalize();
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
-			} catch (executionError: any) {
+			} catch (executionError: unknown) {
 				// If execution fails, we might still have some trace events
-				console.warn('Query execution failed during row tracing:', executionError.message);
+				const message = executionError instanceof Error ? executionError.message : String(executionError);
+				console.warn('Query execution failed during row tracing:', message);
 			}
 
 			// Get the collected trace events and filter for row events
@@ -699,6 +729,243 @@ export const schemaSizeFunc = createIntegratedTableValuedFunction(
 	}
 );
 
+// Effective-lens introspection: the composed read body + per-attribute
+// provenance for a logical table (docs/lens.md § quereus_effective_lens).
+export const effectiveLensFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'quereus_effective_lens',
+		numArgs: 2,
+		deterministic: false, // Depends on current lens deployment state.
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'logical_column', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'source', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// The put disposition: 'authored' (a `with inverse` clause supplies the
+				// put) · 'inferred' (registry invertibility / identity / passthrough) ·
+				// 'none' (computed, read-only). docs/lens.md § quereus_effective_lens.
+				{ name: 'inverse', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// Advertisement-backed provenance: the member relationId of the resolved
+				// primary-storage decomposition that backs this column, or NULL when the
+				// column is name-match / override-only (docs/lens.md § The Default Mapper).
+				{ name: 'advertised_member', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				// The resolved decomposition's anchor relationId (= advertisement id), or
+				// NULL when no advertisement backs this logical table.
+				{ name: 'advertisement_anchor', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'effective_sql', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: [],
+		},
+	},
+	async function* (db: Database, schemaArg: SqlValue, tableArg: SqlValue): AsyncIterable<Row> {
+		if (typeof schemaArg !== 'string' || typeof tableArg !== 'string') {
+			throw new QuereusError('quereus_effective_lens(schema, table) requires two string arguments', StatusCode.ERROR);
+		}
+
+		const schema = db.schemaManager.getSchema(schemaArg);
+		if (!schema) {
+			throw new QuereusError(`quereus_effective_lens: schema '${schemaArg}' not found`, StatusCode.NOTFOUND);
+		}
+		if (schema.kind !== 'logical') {
+			throw new QuereusError(`quereus_effective_lens: schema '${schemaArg}' is not a logical schema`, StatusCode.ERROR);
+		}
+		const slot = schema.getLensSlot(tableArg);
+		if (!slot) {
+			throw new QuereusError(`quereus_effective_lens: no lens slot for '${schemaArg}.${tableArg}'`, StatusCode.NOTFOUND);
+		}
+
+		// Repeat the composed body on every row (symmetry with query_plan), so a
+		// single SELECT surfaces both the per-column provenance and the SQL. The
+		// advertisement columns surface the resolved decomposition (if any) that
+		// backs each logical column — additive to the existing provenance rows.
+		const effectiveSql = astToString(slot.compiledBody);
+		const anchor = slot.advertisement?.storage?.anchorRelationId ?? null;
+		const inverse = lensInverseDispositions(db, slot);
+		for (let i = 0; i < slot.columnProvenance.length; i++) {
+			const p = slot.columnProvenance[i];
+			yield [p.logicalColumn, p.source, inverse[i] ?? 'none', p.advertisedBy ?? null, anchor, effectiveSql];
+		}
+	}
+);
+
+/**
+ * Per-logical-column put disposition for `quereus_effective_lens` — `'authored'`
+ * (a `with inverse` clause supplies the put) / `'inferred'` (an identity,
+ * passthrough, or registry-inverted base write path — including an optional
+ * member's null-extended base column, whose put the fan-out materializes) /
+ * `'none'` (computed, read-only). Read off the **logically** planned body's
+ * backward `updateLineage` (the same surface `column_info` reads, planned via
+ * `_buildPlan` for the same lineage-preservation reason), positionally aligned
+ * with the slot's column provenance — the compiled body's output columns are
+ * the logical columns in declaration order. A body that fails to plan degrades
+ * every column to `'none'` rather than failing the TVF.
+ */
+function lensInverseDispositions(db: Database, slot: LensSlot): string[] {
+	try {
+		const { plan } = db._buildPlan([slot.compiledBody as AST.Statement]);
+		const root = plan.getRelations()[0];
+		if (!root) return slot.columnProvenance.map(() => 'none');
+		const lineage = root.physical?.updateLineage;
+		const attrs = root.getAttributes();
+		return slot.columnProvenance.map((_p, i) => {
+			const attr = attrs[i];
+			const site = resolveBaseSite(attr ? lineage?.get(attr.id) : undefined);
+			if (site.authored) return 'authored';
+			if (site.baseColumn !== undefined) return 'inferred';
+			return 'none';
+		});
+	} catch (e) {
+		log('quereus_effective_lens: lens body failed to plan for inverse dispositions, reporting none: %O', e);
+		return slot.columnProvenance.map(() => 'none');
+	}
+}
+
+// Basis re-decomposition backfill introspection: per-new-basis-relation backfill
+// DDL the engine generates for a pure re-decomposition, tagged engine-generated
+// vs app-supplied (docs/lens.md § The deployed basis representation).
+//
+// Sequencing contract (the generated SQL reads the PRIOR get-body over the PRIOR
+// basis tables, which must still hold data when the app runs it):
+//   1. apply schema Y — migrate the basis (new members created; prior members
+//      retained, not dropped — they are the backfill source).
+//   2. apply schema X — recompile the lens (rotates the snapshot; `previous` now
+//      holds the prior get-body).
+//   3. select * from quereus_basis_backfill('x') — run the re-decomposition /
+//      partial `backfill_sql`; supply app data for missing / needs-data rows.
+//   4. GC the now-detached prior basis members when convenient (out of scope).
+export const basisBackfillFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'quereus_basis_backfill',
+		numArgs: 1,
+		deterministic: false, // Depends on the rotated deployment-snapshot pair.
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'logical_table', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'basis_relation', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// 're-decomposition' | 'partial' | 'needs-data'
+				{ name: 'category', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// The generated insert…select…from(<prior get>); NULL when needs-data.
+				{ name: 'backfill_sql', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				// Comma-joined basis columns the engine backfills.
+				{ name: 'generated_columns', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				// Comma-joined basis columns the application must supply (empty for re-decomposition).
+				{ name: 'missing_columns', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'reason', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: [],
+		},
+	},
+	async function* (db: Database, schemaArg: SqlValue): AsyncIterable<Row> {
+		if (typeof schemaArg !== 'string') {
+			throw new QuereusError('quereus_basis_backfill(logical_schema) requires a string argument', StatusCode.ERROR);
+		}
+
+		const schema = db.schemaManager.getSchema(schemaArg);
+		if (!schema) {
+			throw new QuereusError(`quereus_basis_backfill: schema '${schemaArg}' not found`, StatusCode.NOTFOUND);
+		}
+		if (schema.kind !== 'logical') {
+			throw new QuereusError(`quereus_basis_backfill: schema '${schemaArg}' is not a logical schema`, StatusCode.ERROR);
+		}
+
+		// The rotated snapshot pair is the source of truth — robust to the lens
+		// already pointing at the new basis. With no `previous` (a first deploy, or
+		// nothing deployed) there is nothing to backfill.
+		const snaps = db.declaredSchemaManager.getDeployedLensSnapshots(schemaArg);
+		if (!snaps?.previous || !snaps.current) return;
+
+		// Recompute the live basis hash so a basis that drifted out-of-band since
+		// the last lens deploy surfaces as a per-row warning rather than silently
+		// generating a stale backfill.
+		const basisDeclared = snaps.current.basisSchemaName
+			? db.declaredSchemaManager.getDeclaredSchema(snaps.current.basisSchemaName)
+			: undefined;
+		const liveBasisHash = basisDeclared ? computeSchemaHash(basisDeclared) : undefined;
+
+		const rows = computeBasisBackfill(snaps.previous, snaps.current, liveBasisHash);
+		for (const r of rows) {
+			yield [
+				r.logicalTable,
+				r.basisRelation,
+				r.category,
+				r.backfillSql,
+				r.generatedColumns.join(', '),
+				r.missingColumns.join(', '),
+				r.reason,
+			];
+		}
+	}
+);
+
+// Lens advisory governance introspection: the **expand** path for the deploy
+// summary's `acknowledged: N` tally (docs/lens.md § Acknowledging advisories).
+// One row per advisory of the last deploy of a logical schema — active ones, the
+// ones an in-source `quereus.lens.ack.<code>` tag suppressed, and any that
+// re-surfaced because their recorded fingerprint no longer matches.
+export const lensAdvisoriesFunc = createIntegratedTableValuedFunction(
+	{
+		name: 'quereus_lens_advisories',
+		numArgs: 1,
+		deterministic: false, // Depends on the current lens deploy report.
+		returnType: {
+			typeClass: 'relation',
+			isReadOnly: true,
+			isSet: false,
+			columns: [
+				{ name: 'logical_table', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'code', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'constraint', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'column', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				// 'active' | 're-surfaced' | 'acknowledged' | 'acknowledged-unconditional'
+				{ name: 'status', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+				{ name: 'rationale', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'current_fingerprint', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'recorded_fingerprint', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: true, isReadOnly: true }, generated: true },
+				{ name: 'message', type: { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: true }, generated: true },
+			],
+			keys: [],
+			rowConstraints: [],
+		},
+	},
+	async function* (db: Database, schemaArg: SqlValue): AsyncIterable<Row> {
+		if (typeof schemaArg !== 'string') {
+			throw new QuereusError('quereus_lens_advisories(logical_schema) requires a string argument', StatusCode.ERROR);
+		}
+		const schema = db.schemaManager.getSchema(schemaArg);
+		if (!schema) {
+			throw new QuereusError(`quereus_lens_advisories: schema '${schemaArg}' not found`, StatusCode.NOTFOUND);
+		}
+		if (schema.kind !== 'logical') {
+			throw new QuereusError(`quereus_lens_advisories: schema '${schemaArg}' is not a logical schema`, StatusCode.ERROR);
+		}
+		const report = db.declaredSchemaManager.getDeployedLensReport(schemaArg);
+		if (!report) return; // never deployed (or a blocked deploy left no report)
+
+		// Default-report rows (un-acknowledged + re-surfaced), then the expanded
+		// acknowledged ones. Each row is grouped by its logical table + code.
+		for (const w of report.warnings) {
+			yield [
+				w.site.table, w.code, w.site.constraint ?? null, w.site.column ?? null,
+				w.resurfaced ? 're-surfaced' : 'active', null, null, null, w.message,
+			];
+		}
+		for (const a of report.acknowledged) {
+			yield [
+				a.site.table, a.code, a.site.constraint ?? null, a.site.column ?? null,
+				a.unconditional ? 'acknowledged-unconditional' : 'acknowledged',
+				a.rationale, a.currentFingerprint, a.recordedFingerprint ?? null, a.message,
+			];
+		}
+	}
+);
+
 // Explain assertion analysis and prepared parameterization (pre-physical)
 export const explainAssertionFunc = createIntegratedTableValuedFunction(
 	{
@@ -726,9 +993,15 @@ export const explainAssertionFunc = createIntegratedTableValuedFunction(
 			throw new QuereusError('explain_assertion(name) requires an assertion name', StatusCode.ERROR);
 		}
 
-		// Find assertion across all schemas
+		// Accept `schema.name` (schema-scoped lookup) or a bare name (find-first
+		// across all schemas — assertion names are only unique per schema).
 		const all = db.schemaManager.getAllAssertions();
-		const assertion = all.find(a => a.name.toLowerCase() === assertionName.toLowerCase());
+		const dot = assertionName.indexOf('.');
+		const wantedSchema = dot >= 0 ? assertionName.slice(0, dot).toLowerCase() : undefined;
+		const wantedName = (dot >= 0 ? assertionName.slice(dot + 1) : assertionName).toLowerCase();
+		const assertion = all.find(a =>
+			a.name.toLowerCase() === wantedName
+			&& (wantedSchema === undefined || a.schemaName.toLowerCase() === wantedSchema));
 		if (!assertion) {
 			throw new QuereusError(`Assertion not found: ${assertionName}`, StatusCode.NOTFOUND);
 		}
@@ -755,26 +1028,42 @@ export const explainAssertionFunc = createIntegratedTableValuedFunction(
 			schemaDependencies: new BuildTimeDependencyTracker(),
 			schemaCache: new Map(),
 			cteReferenceCache: new Map(),
-			outputScopes: new Map()
+			outputScopes: new Map(),
+			// The stored body resolves unqualified names against the assertion's
+			// home schema, same as commit-time enforcement.
+			schemaPath: db._homeSchemaPath(assertion.schemaName)
 		};
 
-		const plan = buildBlock(ctx, [ast]);
-		const analyzed = db.optimizer.optimizeForAnalysis(plan, db) as unknown as RelationalPlanNode;
+		// Suppress assertion-hoisting while planning, exactly as the commit-time
+		// evaluator does: otherwise a canonical-shaped assertion's own hoisted
+		// facts fold its violation query to empty and the explain shows no
+		// classifications at all.
+		const analyzed = db.schemaManager.withSuppressedAssertionHoist(() => {
+			const plan = buildBlock(ctx, [ast]);
+			return db.optimizer.optimizeForAnalysis(plan, db) as unknown as RelationalPlanNode;
+		});
 
-		// Classify row/global per relationKey
-		const classifications = analyzeRowSpecific(analyzed);
+		// Classify each table reference as row/group/global.
+		const { classifications, groupKeys } = analyzeRowSpecific(analyzed);
 
 		for (const [relationKey, cls] of classifications) {
 			const base = `${relationKey.split('#')[0]}`;
 			let prepared: string | null = null;
-			if (cls === 'row' && base) {
-				// Prepared parameters are PK-based: ["pk0", "pk1", ...]
-				const [schemaName, tableName] = base.split('.');
+			if (base) {
+				const [schemaName, tableName] = splitBaseKey(base);
 				const table = db._findTable(tableName, schemaName);
 				if (table) {
-					const pkCount = table.primaryKeyDefinition.length;
-					const names = Array.from({ length: pkCount }, (_, i) => `pk${i}`);
-					prepared = JSON.stringify(names);
+					if (cls === 'row') {
+						// Prepared parameters are PK-based: ["pk0", "pk1", ...]
+						const pkCount = table.primaryKeyDefinition.length;
+						const names = Array.from({ length: pkCount }, (_, i) => `pk${i}`);
+						prepared = JSON.stringify(names);
+					} else if (cls === 'group') {
+						// Prepared parameters are the group key column names on this table.
+						const cols = groupKeys.get(relationKey) ?? [];
+						const names = cols.map(idx => table.columns[idx]?.name ?? `col${idx}`);
+						prepared = JSON.stringify(names);
+					}
 				}
 			}
 

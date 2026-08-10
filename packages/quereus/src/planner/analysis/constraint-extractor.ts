@@ -3,7 +3,8 @@
  * Converts scalar expressions into constraints that can be pushed down to virtual tables
  */
 
-import type { ScalarPlanNode, RelationalPlanNode, PlanNode } from '../nodes/plan-node.js';
+import type { ScalarPlanNode, RelationalPlanNode, PlanNode, FunctionalDependency } from '../nodes/plan-node.js';
+import { isRelationalNode } from '../nodes/plan-node.js';
 import { PlanNodeType } from '../nodes/plan-node-type.js';
 import type { ColumnReferenceNode } from '../nodes/reference.js';
 import { BinaryOpNode, BetweenNode, CastNode, UnaryOpNode } from '../nodes/scalar.js';
@@ -16,6 +17,9 @@ import { getSyncLiteral } from '../../parser/utils.js';
 import type { ConstraintOp, PredicateConstraint as VtabPredicateConstraint, RangeSpec as VtabRangeSpec } from '../../vtab/best-access-plan.js';
 import { TableReferenceNode, ColumnReferenceNode as _ColumnRef } from '../nodes/reference.js';
 import { CapabilityDetectors } from '../framework/characteristics.js';
+import { computeClosure, expandEcsToFds, keysOf, type KeyRel } from '../util/fd-utils.js';
+import { effectiveBetweenBoundCollation, effectiveComparisonCollation, effectiveInCollation, operandCollation } from './comparison-collation.js';
+import { isNoOpCast } from './scalar-invertibility.js';
 
 const log = createLogger('planner:analysis:constraint-extractor');
 
@@ -45,6 +49,14 @@ export interface PredicateConstraint extends VtabPredicateConstraint {
 	valueExpr?: ScalarPlanNode | ScalarPlanNode[];
 	/** Binding kind describing how value is supplied */
 	bindingKind?: 'literal' | 'parameter' | 'correlated' | 'expression' | 'mixed';
+	/**
+	 * True when the value binding references a column outside the constrained
+	 * table — i.e. the binding varies per outer row (correlated). Orthogonal to
+	 * `bindingKind` (which describes binding *shape*); this captures row-scope
+	 * *escape*. Used by `computeCoveredKeysForConstraints` to refuse treating
+	 * such a constraint as covering the LHS unique key.
+	 */
+	correlated?: boolean;
 	/** Range specifications for OR_RANGE constraints */
 	ranges?: RangeSpec[];
 }
@@ -75,6 +87,20 @@ export interface TableInfo {
 	columnIndexMap: Map<number, number>; // attributeId -> columnIndex
   /** Logical unique keys for the relation, expressed as output column indexes */
   uniqueKeys?: number[][];
+  /**
+   * Minimal candidate keys from the unified `keysOf` surface — declared keys,
+   * FD-derived keys, the `∅ → all_cols` ≤1-row empty key `[]`, and the
+   * all-columns set key — normalized and deduped. This is the key source for
+   * delta-binding coverage so uniqueness provable only through `physical.fds`
+   * (not declared `RelationType.keys`) still classifies a reference as
+   * 'row'/'group'. `uniqueKeys` is retained unchanged for the other callers
+   * that build their own `TableInfo` (filter.ts, project-node.ts).
+   */
+  candidateKeys?: number[][];
+  /** Functional dependencies on the relation's output columns (from physical properties). */
+  fds?: readonly FunctionalDependency[];
+  /** Equivalence classes over the relation's output columns (from physical properties). */
+  equivClasses?: readonly (readonly number[])[];
 }
 
 /**
@@ -121,8 +147,8 @@ export function extractConstraints(
 		let acc = residualExpressions[0];
 		for (let i = 1; i < residualExpressions.length; i++) {
 			const right = residualExpressions[i];
-			const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: (acc as any).expression, right: (right as any).expression };
-			acc = new BinaryOpNode((acc as any).scope, ast, acc, right);
+			const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
+			acc = new BinaryOpNode(acc.scope, ast, acc, right);
 		}
 		residualPredicate = acc;
 	}
@@ -140,31 +166,16 @@ export function extractConstraints(
   const coveredKeysByTable = new Map<string, number[][]>();
   for (const [rel, constraints] of constraintsByTable) {
     const tInfo = tableInfos.find(t => t.relationKey === rel || t.relationName === rel);
-    if (!tInfo || !tInfo.uniqueKeys || tInfo.uniqueKeys.length === 0) {
+    // Prefer candidateKeys (unified keysOf surface) over declared uniqueKeys so
+    // FD-derived and ≤1-row empty keys are not skipped by the old guard.
+    const candidateKeys = tInfo?.candidateKeys ?? tInfo?.uniqueKeys ?? [];
+    if (!tInfo || candidateKeys.length === 0) {
       coveredKeysByTable.set(rel, []);
       continue;
     }
-    const eqCols = new Set<number>();
-    for (const c of constraints) {
-      if (c.op === '=') {
-        eqCols.add(c.columnIndex);
-      }
-      // Single-value IN could be treated as equality
-      if (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1) {
-        eqCols.add(c.columnIndex);
-      }
-    }
-    const covered: number[][] = [];
-    for (const key of tInfo.uniqueKeys) {
-      if (key.length === 0) {
-        // Zero-length key means at most one row; trivially covered
-        covered.push([]);
-        continue;
-      }
-      const allCovered = key.every(idx => eqCols.has(idx));
-      if (allCovered) covered.push([...key]);
-    }
-    coveredKeysByTable.set(rel, covered);
+    coveredKeysByTable.set(rel, computeCoveredKeysForConstraints(
+      constraints, candidateKeys, tInfo.fds, tInfo.equivClasses
+    ));
   }
 
   return {
@@ -282,6 +293,37 @@ function findTargetRelationKey(expr: ScalarPlanNode, attributeToTableMap: Map<nu
   return undefined;
 }
 
+/**
+ * Walk a scalar subtree collecting the attributeIds of every free
+ * ColumnReference within it. Walking into children (rather than only
+ * unwrapping a top-level Cast) reaches references nested inside arithmetic,
+ * function calls, casts, etc. — e.g. `outer.id + 1`, `coalesce(outer.id, 0)`,
+ * `cast(outer.id + 1 as integer)`.
+ */
+function collectColumnRefAttributeIds(node: ScalarPlanNode): number[] {
+  const ids: number[] = [];
+  const stack: ScalarPlanNode[] = [node];
+  while (stack.length) {
+    const n = stack.pop()!;
+    if (n.nodeType === PlanNodeType.ColumnReference) {
+      ids.push((n as unknown as ColumnReferenceNode).attributeId);
+    }
+    for (const c of n.getChildren()) {
+      stack.push(c as unknown as ScalarPlanNode);
+    }
+  }
+  return ids;
+}
+
+/**
+ * True when a value binding references any column outside the constrained
+ * table (its attributeId is absent from `tableInfo.columnIndexMap`), meaning
+ * the binding varies per outer row and cannot fix the LHS to a single tuple.
+ */
+function bindingReferencesOuterTable(valueExpr: ScalarPlanNode, tableInfo: TableInfo): boolean {
+  return collectColumnRefAttributeIds(valueExpr).some(id => !tableInfo.columnIndexMap.has(id));
+}
+
 function combineParts(parts: ScalarPlanNode[]): ScalarPlanNode | undefined {
   if (parts.length === 0) return undefined;
   if (parts.length === 1) return parts[0];
@@ -289,8 +331,8 @@ function combineParts(parts: ScalarPlanNode[]): ScalarPlanNode | undefined {
   let acc = parts[0];
   for (let i = 1; i < parts.length; i++) {
     const right = parts[i];
-    const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: (acc as any).expression, right: (right as any).expression };
-    acc = new BinaryOpNode((acc as any).scope, ast, acc, right);
+    const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: acc.expression, right: right.expression };
+    acc = new BinaryOpNode(acc.scope, ast, acc, right);
   }
   return acc;
 }
@@ -334,6 +376,13 @@ function extractBinaryConstraint(
     finalOp = baseOp ? flipOperator(baseOp) : null;
 	}
 
+  // `col op NULL` is never true (3VL). A pushed range bound would instead apply
+  // key ordering — where NULL sorts below everything, so `> NULL` matches every
+  // row — so decline and leave the conjunct as a residual filter. Equality stays
+  // extractable: the access-path literal-NULL seek check (rule-select-access-path)
+  // emits an EmptyResult for it.
+  if (constant === null && finalOp !== '=') return null;
+
   if (!columnRef || !finalOp) {
 		log('No column-constant pattern found in binary expression');
 		return null;
@@ -371,16 +420,28 @@ function extractBinaryConstraint(
     const valueSide = (columnIsLeft ? rhs : lhs) as ScalarPlanNode;
     if (!isLiteralConstant(valueSide)) {
       result.valueExpr = valueSide;
-      const innerValue = unwrapCast(valueSide);
+      // Classification only — `valueExpr` above retains the cast, so a converting
+      // cast may be looked through here (see `unwrapCastForBindingKind`).
+      const innerValue = unwrapCastForBindingKind(valueSide);
       if (innerValue.nodeType === PlanNodeType.ParameterReference) {
         result.bindingKind = 'parameter';
       } else if (innerValue.nodeType === PlanNodeType.ColumnReference) {
         const rhsAttrId = (innerValue as unknown as ColumnReferenceNode).attributeId;
         const sameTable = tableInfo.columnIndexMap.has(rhsAttrId);
-        result.bindingKind = sameTable ? 'expression' : 'correlated';
+        if (sameTable) {
+          // Same-table column ref: value is unknown until the row is scanned —
+          // can never be a seek key. Decline; the predicate stays as residual.
+          return null;
+        }
+        result.bindingKind = 'correlated';
       } else {
         result.bindingKind = 'expression';
       }
+      // Free-reference walk: a value side that touches any column outside the
+      // constrained table varies per outer row. This subsumes the bare
+      // other-table ColumnReference case ('correlated') and wrapped/general
+      // 'expression' cases like `outer.id + 1` or `cast(outer.id + 1 as int)`.
+      result.correlated = bindingReferencesOuterTable(valueSide, tableInfo);
     } else {
       result.bindingKind = 'literal';
     }
@@ -417,6 +478,9 @@ function extractBetweenConstraints(
 
   const lowVal = getLiteralValue(low);
   const upVal = getLiteralValue(up);
+  // A NULL bound makes BETWEEN never true (3VL); leave as residual rather than
+  // pushing a seek bound that key ordering would satisfy.
+  if (lowVal === null || upVal === null) return null;
   return [
     {
       columnIndex,
@@ -479,6 +543,10 @@ function extractInConstraint(
   if (!allLiteral) {
     result.valueExpr = expr.values as ScalarPlanNode[];
     result.bindingKind = 'mixed';
+    // A value-list element referencing an outer table makes the IN binding vary
+    // per outer row (e.g. `p.id IN (outer.id)`). Flag it so a singleton IN of
+    // this shape is not mistaken for a covering equality.
+    result.correlated = expr.values.some(v => bindingReferencesOuterTable(v, tableInfo));
   }
 
   return result;
@@ -552,6 +620,54 @@ function flattenOrDisjuncts(expr: ScalarPlanNode): ScalarPlanNode[] {
 }
 
 /**
+ * Collation gate for one branch constraint of an OR collapse (ticket
+ * `or-equality-collapse-collation-blind`).
+ *
+ * Both collapsed forms compare under the *column operand's own* collation —
+ * an OR_RANGE spec's bounds are interpreted in the index's declared-collation
+ * ordering — while each written disjunct compares under its own effective
+ * collation (the shared provenance lattice in `comparison-collation.ts`;
+ * constant folding keeps `'bob' COLLATE NOCASE` as a literal whose *type*
+ * carries NOCASE, so shape checks never see the wrapper). A collapse is
+ * sound only when those two collations are **equal** for the branch; both
+ * directions fail otherwise (under-match: a NOCASE disjunct over a BINARY
+ * column matches fewer rows after collapse; over-match: a BINARY disjunct over
+ * a NOCASE column matches more). Note `eff === 'BINARY'` alone is NOT
+ * sufficient here, unlike {@link equalityConstraintCollationOk}'s
+ * finer-than-enforcement rule — the over-match direction needs eff === the
+ * column's declared collation.
+ */
+function orBranchConstraintCollationOk(c: PredicateConstraint): boolean {
+	const src = c.sourceExpression;
+	if (src instanceof BinaryOpNode) {
+		const colSide = columnSideOf(src, c.attributeId);
+		if (colSide === undefined) return false;
+		return effectiveComparisonCollation(src.left, src.right) === operandCollation(colSide);
+	}
+	if (src instanceof InNode) {
+		// Minted only by `extractInConstraint`, whose condition is a bare
+		// ColumnReferenceNode. The lattice lets a collate-wrapped list element
+		// outrank the column's contribution, so the equality below is genuinely
+		// load-bearing (not just future-proofing).
+		return effectiveInCollation(src) === operandCollation(src.condition);
+	}
+	if (src instanceof BetweenNode) {
+		// A BETWEEN branch contributes two constraints sharing this source;
+		// `emitBetween` resolves each bound's collation independently (bound ??
+		// tested expression), so both must match the column operand.
+		const target = operandCollation(src.expr);
+		return effectiveBetweenBoundCollation(src.expr, src.lower) === target
+			&& effectiveBetweenBoundCollation(src.expr, src.upper) === target;
+	}
+	// Conservative: an unrecognized shape cannot prove its effective collation,
+	// so the whole OR stays residual. This is the *opposite* polarity of
+	// `equalityConstraintCollationOk`'s permissive fallback — there a wrong
+	// answer only loses a covered-key witness; here it would rewrite the
+	// comparison a consuming seek performs and produce wrong rows.
+	return false;
+}
+
+/**
  * Attempt to extract index-friendly constraints from an OR expression.
  *
  * Handles two cases:
@@ -594,6 +710,24 @@ function tryExtractOrBranches(
 		}
 	}
 	if (allRelations.size !== 1) return null;
+
+	// Collation pre-gate covering both collapse cases below (IN and OR_RANGE
+	// both compare under the column's own collation): every branch constraint's
+	// effective collation must equal it, else the whole OR stays residual —
+	// a completeness loss only, never a semantics change. Reviewer note:
+	// `effectivePredicateCollation` (rule-select-access-path) still resolves an
+	// OR `sourceExpression` to BINARY, but post-gate every surviving collapsed
+	// constraint's true collation equals the column's declared collation, so
+	// the cover analysis is at worst conservative (BINARY-vs-NOCASE-index →
+	// COARSER_SAFE keeps the semantically-correct OR residual; ranges decline).
+	// Carrying the resolved collation on the constraint would make it precise —
+	// an optional follow-up, not required for correctness.
+	for (const b of branches) {
+		if (!b.constraints.every(orBranchConstraintCollationOk)) {
+			log('OR collapse declined: branch effective collation does not match column collation');
+			return null;
+		}
+	}
 
 	// Case 1: All branches are single equality or IN on the same column → collapse to IN
 	const allEqOrIn = branches.every(b =>
@@ -771,14 +905,62 @@ function isOrExpression(expr: ScalarPlanNode): boolean {
 }
 
 /**
- * Check if node is a column reference
- */
-/**
- * Unwrap a CastNode inserted by the planner for cross-category coercion.
- * Returns the inner operand if node is a Cast, otherwise returns the node itself.
+ * Strip only *value-preserving* wrappers, exposing the underlying literal /
+ * column reference for shape matching. Every caller of this helper discards the
+ * wrapper, so anything it strips must leave the compared value unchanged.
+ *
+ * Only a no-op `CAST` (target logical type equal to the operand's — see
+ * {@link isNoOpCast}) qualifies, and chains of them are stripped. A **converting**
+ * `CAST` changes the compared value: `cast(x as integer) = 1` over a `text`
+ * column would be recognized as `x = 1` and pushed down as a seek key on the
+ * *stored* text, which under storage-class ordering matches nothing — and since
+ * the conjunct is reported as fully consumed, no residual `FILTER` survives to
+ * catch it. This is not exotic SQL: `insertCrossTypeCoercion`
+ * (`building/expression.ts`) synthesizes exactly that cast for a bare
+ * `where x = 1` against a `text` column. Symmetrically on the value side,
+ * `getLiteralValue` returns the *pre-cast* literal, so stripping
+ * `cast(1 as text)` would seek on the integer `1`.
+ *
+ * A `CollateNode` is never stripped either: a collate-wrapped literal or column
+ * changes the comparison's effective collation, so recognizing
+ * `b = 'x' collate nocase` as an ordinary `col = lit` constraint would mint a
+ * seek / covered-key witness under the column's declared collation while the
+ * runtime compares NOCASE — wrong rows from a seek, false ≤1-row claims from
+ * the covered-key path. Because only no-op casts are stripped, every recognized
+ * `col = lit` comparison's effective collation equals the column's declared
+ * collation (the key's enforcement collation), which is what keeps
+ * `FilterNode`'s covered-key detection sound.
+ *
+ * Pinned by seek-correctness tests (tickets
+ * `collation-blind-equality-fact-extraction` and
+ * `bug-cast-stripped-from-seek-constraints`); do not loosen without gating
+ * consumers on the wrapper. `sat-checker.ts`'s `unwrap()` and
+ * `coarsened-key.ts` carry the same rule.
+ *
+ * Classification-only callers that *retain* the wrapper use
+ * {@link unwrapCastForBindingKind} instead.
  */
 function unwrapCast(node: ScalarPlanNode): ScalarPlanNode {
-	return node.nodeType === PlanNodeType.Cast ? (node as CastNode).operand : node;
+	let cur = node;
+	while (cur instanceof CastNode && isNoOpCast(cur)) cur = cur.operand;
+	return cur;
+}
+
+/**
+ * Strip *any* `CastNode` chain — including converting casts — to classify the
+ * shape of a value-side expression.
+ *
+ * Sound only where the cast is retained in the emitted constraint: the two
+ * callers (`extractBinaryConstraint`'s `bindingKind` selection and
+ * {@link isDynamicValue}) keep the whole cast node in `valueExpr`, which is
+ * evaluated at runtime. That preserves parameter / correlated seek pushdown for
+ * `x = cast(:p as integer)`. Never use this where the wrapper is discarded —
+ * see {@link unwrapCast}.
+ */
+function unwrapCastForBindingKind(node: ScalarPlanNode): ScalarPlanNode {
+	let cur = node;
+	while (cur instanceof CastNode) cur = cur.operand;
+	return cur;
 }
 
 function isColumnReference(node: ScalarPlanNode): node is ColumnReferenceNode {
@@ -786,28 +968,32 @@ function isColumnReference(node: ScalarPlanNode): node is ColumnReferenceNode {
 }
 
 /**
- * Extract the underlying ColumnReferenceNode, unwrapping a planner-inserted
- * CastNode if present.
+ * Extract the underlying ColumnReferenceNode, unwrapping a value-preserving
+ * (no-op) CastNode if present.
  */
 function getColumnReference(node: ScalarPlanNode): ColumnReferenceNode {
 	return unwrapCast(node) as unknown as ColumnReferenceNode;
 }
 
 /**
- * Check if node is a literal constant (sees through planner-inserted CastNodes).
+ * Check if node is a literal constant (sees through value-preserving CastNodes).
  */
 function isLiteralConstant(node: ScalarPlanNode): node is LiteralNode {
 	return unwrapCast(node).nodeType === PlanNodeType.Literal;
 }
 
+/**
+ * True when the value side is a parameter or a column reference from any table
+ * (correlation handled later). Classification only — the caller keeps the cast
+ * in `valueExpr` and evaluates it at runtime, so a converting cast is fine here.
+ */
 function isDynamicValue(node: ScalarPlanNode): boolean {
-  const inner = unwrapCast(node);
-  // Parameter or column reference from any table (correlation handled later)
+  const inner = unwrapCastForBindingKind(node);
   return inner.nodeType === PlanNodeType.ParameterReference || inner.nodeType === PlanNodeType.ColumnReference;
 }
 
 /**
- * Get literal value from literal node (sees through planner-inserted CastNodes).
+ * Get literal value from literal node (sees through value-preserving CastNodes).
  */
 function getLiteralValue(node: ScalarPlanNode): SqlValue {
 	const literalNode = unwrapCast(node) as LiteralNode;
@@ -842,22 +1028,17 @@ export function extractConstraintsForTable(
 	targetTableRelationKey: string
 ): PredicateConstraint[] {
 	const constraints: PredicateConstraint[] = [];
+	const tableInfos = createTableInfosFromPlan(plan).filter(
+		info => info.relationKey === targetTableRelationKey
+	);
+	if (tableInfos.length === 0) return constraints;
 
-	// Walk the plan tree looking for filter predicates
-	walkPlanForPredicates(plan, (predicate, sourceNode) => {
-		// Create table info for the target table only
-		const tableInfos = createTableInfosFromPlan(plan).filter(
-			info => info.relationKey === targetTableRelationKey
-		);
-
-		if (tableInfos.length > 0) {
-			const result = extractConstraints(predicate, tableInfos);
-			const tableConstraints = result.constraintsByTable.get(targetTableRelationKey);
-			if (tableConstraints) {
-				constraints.push(...tableConstraints);
-				log('Found %d constraints for table %s from %s',
-					tableConstraints.length, targetTableRelationKey, sourceNode);
-			}
+	walkPredicatesConstraining(plan, targetTableRelationKey, predicate => {
+		const result = extractConstraints(predicate, tableInfos);
+		const tableConstraints = result.constraintsByTable.get(targetTableRelationKey);
+		if (tableConstraints) {
+			constraints.push(...tableConstraints);
+			log('Found %d constraints for table %s', tableConstraints.length, targetTableRelationKey);
 		}
 	});
 
@@ -865,31 +1046,63 @@ export function extractConstraintsForTable(
 }
 
 /**
- * Extract constraints and combined residual predicate for a specific table
+ * Visit every predicate in `plan` that can constrain the table instance
+ * `targetTableRelationKey` — i.e. every predicate whose own relational INPUT
+ * contains that table reference.
+ *
+ * A plain "walk everything" sweep is unsound here: a subquery body hangs off a
+ * scalar predicate, so `where exists (select 1 from t where t.s = a.i)` puts the
+ * inner `t.s = a.i` inside the outer Filter's subtree. Attributing it to `a`
+ * turns it into a constraint (and then a residual predicate) on `a`'s access
+ * path, which hoists a predicate reading column `s` over a relation that has no
+ * such column. The subquery's own scans stay reachable — an inner scan of the
+ * target legitimately collects its own correlated predicate — but a predicate is
+ * never attributed to a table outside its input.
+ *
+ * The target is matched on the instance-unique `#<nodeId>` suffix that
+ * {@link createTableInfoFromNode} appends, so callers that build the key with a
+ * bare table name and callers that schema-qualify it both work.
+ *
+ * @returns whether the target table reference sits in this node's relational input
  */
-export function extractConstraintsAndResidualForTable(
-    plan: RelationalPlanNode,
-    targetTableRelationKey: string
-): { constraints: PredicateConstraint[]; residualPredicate?: ScalarPlanNode } {
-    const constraints: PredicateConstraint[] = [];
-    const residuals: ScalarPlanNode[] = [];
+function walkPredicatesConstraining(
+	plan: PlanNode,
+	targetTableRelationKey: string,
+	callback: (predicate: ScalarPlanNode) => void,
+): boolean {
+	// NOTE: recursive over the native stack (as the sweep this replaced was). Plan depth is
+	// bounded by query nesting today; if a generated query ever overflows here, convert to the
+	// explicit-stack shape `PlanNode.computePostOrder` uses — the post-order return value
+	// (`inScope` bubbling up) is what makes the recursion convenient rather than necessary.
+	//
+	// NOTE: scope is followed through `getChildren()` only. Three nodes override
+	// `getRelations()` to expose a relation that is NOT a child — `InsertNode.table`,
+	// `AddConstraintNode.table`, `AlterTableNode.table` — so a target key naming one of those
+	// DML/DDL target references is unreachable here and yields no constraints. Harmless today:
+	// those references carry their own attribute ids, which no predicate in the plan mentions,
+	// so the old unguarded sweep found nothing for them either, and `binding-extractor` falls
+	// back to `{kind: 'global'}` on an empty covered-key set. If a caller ever needs
+	// constraints for a DML target reference, walk `getRelations()` here too.
+	const idSuffix = `#${plan.id ?? 'unknown'}`;
+	let inScope = plan instanceof TableReferenceNode && targetTableRelationKey.endsWith(idSuffix);
 
-    walkPlanForPredicates(plan, (predicate) => {
-        const tableInfos = createTableInfosFromPlan(plan).filter(
-            info => info.relationKey === targetTableRelationKey
-        );
-        if (tableInfos.length === 0) return;
-        const result = extractConstraints(predicate, tableInfos);
-        const tableConstraints = result.constraintsByTable.get(targetTableRelationKey);
-        if (tableConstraints && tableConstraints.length) {
-            constraints.push(...tableConstraints);
-        }
-        if (result.residualPredicate) {
-            residuals.push(result.residualPredicate);
-        }
-    });
+	// Only a RELATIONAL child of a RELATIONAL node feeds that node's input. A relational node
+	// reached through a scalar expression is a subquery body — a different scope — so what it
+	// contains must not put the target in scope here (its own predicates were already collected
+	// inside the recursion).
+	const planIsRelational = isRelationalNode(plan);
+	for (const child of plan.getChildren()) {
+		const foundBelow = walkPredicatesConstraining(child, targetTableRelationKey, callback);
+		if (foundBelow && planIsRelational && isRelationalNode(child)) inScope = true;
+	}
 
-    return { constraints, residualPredicate: combineResiduals(residuals) };
+	if (inScope && CapabilityDetectors.isPredicateSource(plan)) {
+		for (const predicate of plan.getPredicates() as ReadonlyArray<ScalarPlanNode>) {
+			callback(predicate);
+		}
+	}
+
+	return inScope;
 }
 
 /**
@@ -903,69 +1116,221 @@ export function extractCoveredKeysForTable(
     const constraints: PredicateConstraint[] = extractConstraintsForTable(plan, targetTableRelationKey);
     const tInfos = createTableInfosFromPlan(plan).filter(info => info.relationKey === targetTableRelationKey);
     if (tInfos.length === 0) return [];
-    const uniqueKeys = tInfos[0].uniqueKeys ?? [];
-    return computeCoveredKeysForConstraints(constraints, uniqueKeys);
+    // Source candidate keys from the unified `keysOf` surface (candidateKeys),
+    // falling back to declared uniqueKeys only if it is somehow absent.
+    const candidateKeys = tInfos[0].candidateKeys ?? tInfos[0].uniqueKeys ?? [];
+    return computeCoveredKeysForConstraints(constraints, candidateKeys, tInfos[0].fds, tInfos[0].equivClasses);
 }
 
 /**
- * Given a set of constraints and a table's unique keys, compute which keys are fully covered by equality.
+ * Locate the (cast-unwrapped) column-reference side of a binary comparison
+ * matching `attributeId`. Used by {@link equalityConstraintCollationOk} to read
+ * the constrained column's declared collation off its reference type.
+ */
+function columnSideOf(src: BinaryOpNode, attributeId: number): ScalarPlanNode | undefined {
+	const l = unwrapCast(src.left);
+	if (l.nodeType === PlanNodeType.ColumnReference && (l as unknown as ColumnReferenceNode).attributeId === attributeId) return l;
+	const r = unwrapCast(src.right);
+	if (r.nodeType === PlanNodeType.ColumnReference && (r as unknown as ColumnReferenceNode).attributeId === attributeId) return r;
+	return undefined;
+}
+
+/**
+ * Collation gate for an equality constraint feeding covered-key detection.
+ *
+ * A covered key proves ≤1 row only when each pinned key column's comparison
+ * cannot conflate values the key's enforcement distinguishes — i.e. the
+ * comparison's effective collation is **at least as fine** as the enforcement
+ * collation (the column's declared collation: PK/UNIQUE enforcement compares
+ * under it — see the memory layer manager's uniqueness checks). The two
+ * decidable cases: effective collation BINARY (finest), or equal to the
+ * declared collation.
+ *
+ * The shape that needs this: constant folding collapses
+ * `'bob' COLLATE NOCASE` into a `LiteralNode` whose *type* keeps
+ * `collationName: 'NOCASE'` (const-pass preserves type metadata), so
+ * `b = 'bob' collate nocase` reaches extraction as an ordinary `col = lit`
+ * constraint that compares NOCASE at runtime over a BINARY-enforced key —
+ * counting it as covering produced a false ≤1-row claim (ticket
+ * `collation-blind-equality-fact-extraction`, repro 1). A `COLLATE` wrapper on
+ * the *column* side never folds and is already structurally rejected by
+ * `unwrapCast` being Cast-only.
+ *
+ * IN constraints are gated by {@link inConstraintCollationOk}: under the
+ * provenance lattice a collate-wrapped list element (folded to a literal whose
+ * type carries rank-3 NOCASE) can outrank the column condition, so listed
+ * values' collations are no longer inert.
+ */
+function equalityConstraintCollationOk(c: PredicateConstraint): boolean {
+	const src = c.sourceExpression;
+	if (src instanceof BinaryOpNode) {
+		const eff = effectiveComparisonCollation(src.left, src.right);
+		if (eff === 'BINARY') return true;
+		const colSide = columnSideOf(src, c.attributeId);
+		return colSide !== undefined && operandCollation(colSide) === eff;
+	}
+	// Every `op: '='` constraint today is minted by `extractBinaryConstraint`
+	// with the BinaryOpNode itself as `sourceExpression` (OR collapse emits
+	// only 'IN'/'OR_RANGE'), so this permissive fallback is unreachable for
+	// equalities. If a new producer mints '=' constraints from another shape,
+	// it must either carry the comparison or be gated here explicitly.
+	return true;
+}
+
+/**
+ * Collation gate for a (singleton) IN constraint feeding covered-key
+ * detection — the IN analogue of {@link equalityConstraintCollationOk}. The
+ * runtime membership test (`emitIn`) compares under the lattice-resolved
+ * collation over the condition AND every listed value, so a wrapped element
+ * like `b IN ('bob' collate nocase)` compares NOCASE over a BINARY-enforced
+ * key and must not count as covering. Sound cases mirror the equality gate:
+ * effective BINARY (finest), or equal to the column operand's own (declared)
+ * collation. OR-collapse-minted IN constraints carry the OR BinaryOpNode as
+ * `sourceExpression` and were already vetted per-branch by
+ * {@link orBranchConstraintCollationOk}.
+ */
+function inConstraintCollationOk(c: PredicateConstraint): boolean {
+	const src = c.sourceExpression;
+	if (src instanceof InNode) {
+		const eff = effectiveInCollation(src);
+		if (eff === 'BINARY') return true;
+		return operandCollation(src.condition) === eff;
+	}
+	return true;
+}
+
+/**
+ * Given a set of constraints and a table's unique keys, compute which keys are fully covered by
+ * equality (optionally using FDs and equivalence classes to expand the equality-covered column set
+ * via closure). A key is covered if every column in it lies in the closure of equality-covered
+ * columns under the supplied FDs + EC-derived FDs. Equality constraints whose
+ * comparison collation is coarser than the column's declared (enforcement)
+ * collation are skipped — see {@link equalityConstraintCollationOk}.
  */
 export function computeCoveredKeysForConstraints(
     constraints: readonly PredicateConstraint[],
-    tableUniqueKeys: readonly number[][]
+    tableUniqueKeys: readonly number[][],
+    fds?: readonly FunctionalDependency[],
+    equivClasses?: readonly (readonly number[])[]
 ): number[][] {
     const eqCols = new Set<number>();
     for (const c of constraints) {
+        // Skip correlated bindings: a value side that escapes the table's row
+        // scope (`col = <outer-ref>`, `col = outer.id + 1`, `col IN (outer.id)`)
+        // does not cover the LHS unique key for delta-binding purposes — the
+        // RHS varies per outer row, so the binding extractor cannot fix the LHS
+        // to a single parameter tuple. Without this guard, the constraint is
+        // treated as a covering equality, the relation is classified `'row'`,
+        // and the kernel dispatches a per-tuple residual whose inner key filter
+        // (`col = :pk0`) intersected with the correlated binding can collapse to
+        // a structurally-empty seek (`outer.id = 1 AND p.id = 3`), producing
+        // false-positive NOT-EXISTS violations.
+        //
+        // Discovered via `lamina-quereus-assertion-residual-correlated-binding`:
+        // lamina's planner leaves `p.id = cp.id` as a Filter over a SeqScan,
+        // whereas MemoryTable's optimizer rewrites it to an IndexSeek whose
+        // `seekKeys` are not exposed via `getPredicates` (hiding the constraint
+        // from `extractConstraintsForTable`). Both backends' analyzed plans
+        // should agree on classification. The `correlated` flag is computed at
+        // extraction time (where the constrained table's attribute set is known)
+        // and captures bare-, wrapped-, and singleton-IN-correlated shapes
+        // uniformly — see `bindingReferencesOuterTable`.
+        if (c.correlated) continue;
         if (c.op === '=') {
-            eqCols.add(c.columnIndex);
+            if (equalityConstraintCollationOk(c)) eqCols.add(c.columnIndex);
         }
         if (c.op === 'IN' && Array.isArray(c.value) && (c.value as unknown[]).length === 1) {
-            eqCols.add(c.columnIndex);
+            if (inConstraintCollationOk(c)) eqCols.add(c.columnIndex);
         }
     }
+
+    // Expand the equality-covered set under FD/EC closure. Without FDs/ECs the closure
+    // is just eqCols, so behaviour is unchanged for callers that don't pass them.
+    const allFds = (fds && fds.length > 0) || (equivClasses && equivClasses.length > 0)
+        ? expandEcsToFds(equivClasses ?? [], fds ?? [])
+        : [];
+    const closure = allFds.length > 0 ? computeClosure(eqCols, allFds) : eqCols;
+
     const covered: number[][] = [];
     for (const key of tableUniqueKeys) {
         if (key.length === 0) {
             covered.push([]);
             continue;
         }
-        const allCovered = key.every(idx => eqCols.has(idx));
+        const allCovered = key.every(idx => closure.has(idx));
         if (allCovered) covered.push([...key]);
     }
     return covered;
 }
 
 /**
- * Analyze plan to classify each TableReference instance as 'row' (row-specific) or 'global'.
- * Row-specific means equality constraints fully cover at least one unique key at that reference,
- * AND no identity-breaking node (aggregate without PK grouping, set operation, window) sits above it.
+ * Three-way classification used by the reusable delta executor kernel:
+ *
+ * - `'row'`   — equality constraints fully cover at least one unique key of the table
+ *   reference at that site (possibly via FD closure). The runtime parameterizes on
+ *   the changed PK tuples and runs ≤1 row through the violation predicate per tuple.
+ * - `'group'` — the table reference sits beneath an aggregate whose GROUP BY columns
+ *   (possibly via FD closure under the aggregate's source) cover a unique key of the
+ *   reference. The aggregate output is row-unique per group key; the runtime
+ *   parameterizes on changed group keys (including OLD and NEW projections when a
+ *   row's group-key value changes).
+ * - `'global'` — neither holds; the violation query runs unparameterized.
  */
-export function analyzeRowSpecific(
-    plan: RelationalPlanNode | PlanNode
-): Map<string, 'row' | 'global'> {
-    const result = new Map<string, 'row' | 'global'>();
-    const infos = createTableInfosFromPlan(plan as RelationalPlanNode);
-    for (const info of infos) {
-        const covered = extractCoveredKeysForTable(plan as RelationalPlanNode, info.relationKey);
-        result.set(info.relationKey, covered.length > 0 ? 'row' : 'global');
-    }
+export type RowClassification = 'row' | 'group' | 'global';
 
-    // Post-process: demote 'row' to 'global' for table references beneath identity-breaking nodes
-    demoteForIdentityBreakingNodes(plan as unknown as PlanNode, result, infos);
-
-    return result;
+/**
+ * Result of analyzing a plan for per-relation row/group/global classification.
+ */
+export interface RowSpecificResult {
+    /** Per-relationKey classification. */
+    classifications: Map<string, RowClassification>;
+    /** For group-classified relations, the group-key columns expressed as output column
+     *  indices on the underlying table reference. */
+    groupKeys: Map<string, number[]>;
 }
 
 /**
- * Walk the plan tree and demote table reference classifications to 'global' when they
- * appear beneath identity-breaking nodes:
- * - AggregateNode: unless GROUP BY exactly covers a unique key of the table
- * - SetOperationNode: always demotes (conservative)
- * - WindowNode: always demotes (conservative)
+ * Analyze plan to classify each TableReference instance as 'row', 'group', or 'global'.
+ *
+ * Initial pass: a reference is `'row'` iff equality constraints on the path cover one of
+ * its unique keys (under FD closure if FDs/ECs are available at the reference).
+ *
+ * Post-pass: walk identity-breaking nodes (Aggregate, SetOperation, Window) and adjust:
+ *  - Aggregate: if GROUP BY closure covers a unique key of the underlying reference,
+ *    promote `'global'` → `'group'` and record the minimal GROUP BY column subset.
+ *    Otherwise demote `'row'` → `'global'`. Aggregate without GROUP BY emits one row →
+ *    every reference beneath is `'row'`.
+ *  - SetOperation: demote everything beneath to `'global'` (conservative).
+ *  - Window: pass-through (windowing preserves input row count).
  */
-function demoteForIdentityBreakingNodes(
+export function analyzeRowSpecific(
+    plan: RelationalPlanNode | PlanNode
+): RowSpecificResult {
+    const classifications = new Map<string, RowClassification>();
+    const groupKeys = new Map<string, number[]>();
+    const infos = createTableInfosFromPlan(plan as RelationalPlanNode);
+    for (const info of infos) {
+        const covered = extractCoveredKeysForTable(plan as RelationalPlanNode, info.relationKey);
+        classifications.set(info.relationKey, covered.length > 0 ? 'row' : 'global');
+    }
+
+    // Post-process identity-breaking nodes: demote 'row' → 'global' or promote 'global' → 'group'.
+    classifyForIdentityBreakingNodes(plan as unknown as PlanNode, classifications, groupKeys, infos);
+
+    return { classifications, groupKeys };
+}
+
+/**
+ * Walk the plan tree and adjust table-reference classifications based on identity-breaking
+ * nodes encountered between the reference and the root:
+ * - AggregateNode / StreamAggregateNode / HashAggregateNode: see `classifyForAggregate`.
+ * - SetOperationNode: demote everything beneath to 'global' (conservative).
+ * - WindowNode: pass-through — windowing preserves input row count.
+ */
+function classifyForIdentityBreakingNodes(
     node: PlanNode,
-    classifications: Map<string, 'row' | 'global'>,
+    classifications: Map<string, RowClassification>,
+    groupKeys: Map<string, number[]>,
     tableInfos: TableInfo[]
 ): void {
     if (!node) return;
@@ -974,25 +1339,21 @@ function demoteForIdentityBreakingNodes(
 
     // SetOperation: demote all table references beneath to 'global'
     if (nodeType === PlanNodeType.SetOperation) {
-        demoteAllBeneath(node, classifications);
-        return; // No need to recurse further — everything below is already demoted
-    }
-
-    // Window: demote all table references beneath to 'global'
-    if (nodeType === PlanNodeType.Window) {
-        demoteAllBeneath(node, classifications);
+        demoteAllBeneath(node, classifications, groupKeys);
         return;
     }
 
-    // Aggregate: check if GROUP BY covers a unique key per table reference beneath
-    if (nodeType === PlanNodeType.Aggregate) {
-        demoteForAggregate(node, classifications, tableInfos);
-        return; // Already recurses into source
+    // Aggregate (logical or physical variants): adjust per reference.
+    if (nodeType === PlanNodeType.Aggregate
+        || nodeType === PlanNodeType.StreamAggregate
+        || nodeType === PlanNodeType.HashAggregate) {
+        classifyForAggregate(node, classifications, groupKeys, tableInfos);
+        return;
     }
 
-    // Recurse into children
+    // Window and anything else: recurse into children.
     for (const child of node.getChildren()) {
-        demoteForIdentityBreakingNodes(child as unknown as PlanNode, classifications, tableInfos);
+        classifyForIdentityBreakingNodes(child as unknown as PlanNode, classifications, groupKeys, tableInfos);
     }
 }
 
@@ -1013,109 +1374,161 @@ function collectRelationKeysBeneath(node: PlanNode): Set<string> {
     return keys;
 }
 
-/** Demote all table references beneath a node to 'global' */
-function demoteAllBeneath(node: PlanNode, classifications: Map<string, 'row' | 'global'>): void {
+/** Demote all table references beneath a node to 'global' and clear any group keys */
+function demoteAllBeneath(
+    node: PlanNode,
+    classifications: Map<string, RowClassification>,
+    groupKeys: Map<string, number[]>
+): void {
     const keys = collectRelationKeysBeneath(node);
     for (const key of keys) {
         if (classifications.has(key)) {
             classifications.set(key, 'global');
+            groupKeys.delete(key);
         }
     }
 }
 
 /**
- * For an AggregateNode, check if GROUP BY columns cover a unique key of each table reference
- * beneath the aggregate's source. If not, demote that table reference to 'global'.
+ * For an aggregate node, check each table reference beneath:
+ *  - If the closure of GROUP BY bare-column source-side column indices (under the
+ *    aggregate's source physical FDs/ECs) covers one of the table reference's unique
+ *    keys (mapped into source-side indices), classify the reference as `'group'` and
+ *    record the minimal subset of GROUP BY columns that produces the cover. Group keys
+ *    are reported in the table reference's own column-index space.
+ *  - Else if the reference is already `'row'` (equality cover at a Filter beneath the
+ *    aggregate), keep it as `'row'` — equality coverage is stronger than group coverage.
+ *  - Otherwise classify as `'global'`.
+ *
+ * Special case: GROUP BY is empty (single-group aggregate). The aggregate emits one
+ * row total, so existing 'row'-classified references stay 'row' and we just recurse.
  */
-function demoteForAggregate(
+function classifyForAggregate(
     node: PlanNode,
-    classifications: Map<string, 'row' | 'global'>,
+    classifications: Map<string, RowClassification>,
+    groupKeys: Map<string, number[]>,
     tableInfos: TableInfo[]
 ): void {
     const aggNode = node as unknown as { source: RelationalPlanNode; groupBy: readonly ScalarPlanNode[] };
-    if (!aggNode.groupBy || !aggNode.source) return;
+    if (!aggNode.source) return;
 
-    // Collect attribute IDs from GROUP BY expressions (only ColumnReference expressions count)
-    const groupByAttrIds = new Set<number>();
-    for (const expr of aggNode.groupBy) {
-        if (expr.nodeType === PlanNodeType.ColumnReference) {
-            groupByAttrIds.add((expr as unknown as _ColumnRef).attributeId);
-        }
+    const groupBy = aggNode.groupBy ?? [];
+
+    if (groupBy.length === 0) {
+        // Single-group aggregate: aggregate output is one row. Existing 'row' coverage
+        // (e.g. equality at a Filter below) stays 'row'; everything else stays 'global'.
+        classifyForIdentityBreakingNodes(aggNode.source as unknown as PlanNode, classifications, groupKeys, tableInfos);
+        return;
     }
 
-    // Check each table reference beneath the aggregate's source
+    const sourceIndex = (aggNode.source as RelationalPlanNode).getAttributeIndex();
+    // Source physical properties carry FDs/ECs propagated from below — including any
+    // ECs added by Filters between the aggregate and the table reference.
+    const sourcePhysical = (aggNode.source as unknown as { physical?: { fds?: readonly FunctionalDependency[]; equivClasses?: readonly (readonly number[])[] } }).physical;
+    const sourceFds = sourcePhysical?.fds ?? [];
+    const sourceEcs = sourcePhysical?.equivClasses ?? [];
+
+    // Map each bare-column GROUP BY expression to its source-side column index.
+    // Track the table reference's table-column index alongside so we can emit groupKeys
+    // in the table's own index space at the end.
+    const groupByEntries: Array<{ attrId: number; sourceColIdx: number }> = [];
+    for (const expr of groupBy) {
+        if (expr.nodeType !== PlanNodeType.ColumnReference) continue;
+        const attrId = (expr as unknown as _ColumnRef).attributeId;
+        const sourceColIdx = sourceIndex.get(attrId) ?? -1;
+        if (sourceColIdx >= 0) groupByEntries.push({ attrId, sourceColIdx });
+    }
+
+    // Closure of all bare GROUP BY columns under source FDs + EC-derived FDs, in source
+    // column-index space.
+    const closureFds = expandEcsToFds(sourceEcs, sourceFds);
+    const allGroupSourceCols = new Set(groupByEntries.map(e => e.sourceColIdx));
+    const closure = computeClosure(allGroupSourceCols, closureFds);
+
     const keysBelow = collectRelationKeysBeneath(aggNode.source as unknown as PlanNode);
     for (const relKey of keysBelow) {
-        if (classifications.get(relKey) !== 'row') continue; // Already global
+        const current = classifications.get(relKey);
+        if (current === 'row') {
+            // Equality coverage is stronger than group coverage — keep as 'row'.
+            continue;
+        }
 
-        // Find this table's unique keys
         const tInfo = tableInfos.find(t => t.relationKey === relKey);
-        if (!tInfo || !tInfo.uniqueKeys || tInfo.uniqueKeys.length === 0) {
+        // Group-key coverage uses the unified candidate-key surface (declared +
+        // FD-derived + ≤1-row), mirroring the equality-coverage path.
+        const candidateKeys = tInfo?.candidateKeys ?? tInfo?.uniqueKeys ?? [];
+        if (!tInfo || candidateKeys.length === 0) {
             classifications.set(relKey, 'global');
             continue;
         }
 
-        // Check if any unique key is fully covered by GROUP BY attribute IDs
-        const attrIdsByColIndex = new Map<number, number>();
-        for (const attr of tInfo.attributes) {
-            const colIdx = tInfo.columnIndexMap.get(attr.id);
-            if (colIdx !== undefined) {
-                attrIdsByColIndex.set(colIdx, attr.id);
-            }
+        // Map each table-column index to its source-side index by attribute ID.
+        // tableColIdx i has attrId = tInfo.attributes[i].id; that attr appears in
+        // the source at some index (if not dropped by a Project between table and source).
+        const attrIdByTableCol = new Map<number, number>();
+        for (let i = 0; i < tInfo.attributes.length; i++) {
+            attrIdByTableCol.set(i, tInfo.attributes[i].id);
+        }
+        const tableColToSourceCol = new Map<number, number>();
+        for (const [tableColIdx, attrId] of attrIdByTableCol) {
+            const sourceColIdx = sourceIndex.get(attrId) ?? -1;
+            if (sourceColIdx >= 0) tableColToSourceCol.set(tableColIdx, sourceColIdx);
         }
 
-        let anyCovered = false;
-        for (const key of tInfo.uniqueKeys) {
-            if (key.length === 0) { anyCovered = true; break; }
-            const allCovered = key.every(colIdx => {
-                const attrId = attrIdsByColIndex.get(colIdx);
-                return attrId !== undefined && groupByAttrIds.has(attrId);
+        const keyCoveredInSourceSpace = (key: readonly number[]): boolean => {
+            if (key.length === 0) return true;
+            return key.every(tcol => {
+                const scol = tableColToSourceCol.get(tcol);
+                return scol !== undefined && closure.has(scol);
             });
-            if (allCovered) { anyCovered = true; break; }
+        };
+
+        const coversAnyKey = candidateKeys.some(keyCoveredInSourceSpace);
+        if (!coversAnyKey) {
+            classifications.set(relKey, 'global');
+            continue;
         }
 
-        if (!anyCovered) {
-            classifications.set(relKey, 'global');
+        // Greedy minimization: drop GROUP BY columns one at a time; keep removals that
+        // don't break the cover. We minimize over groupByEntries in source-column space
+        // (since closure operates there), then translate back to the table reference's
+        // column indices for the reported groupKeys.
+        const sourceColsByGroupEntry = groupByEntries.map(e => e.sourceColIdx);
+        const minimalSourceCols = new Set<number>(sourceColsByGroupEntry);
+        for (const c of [...minimalSourceCols]) {
+            const trial = new Set<number>(minimalSourceCols);
+            trial.delete(c);
+            const trialClosure = computeClosure(trial, closureFds);
+            const stillCovers = candidateKeys.some(key => {
+                if (key.length === 0) return true;
+                return key.every(tcol => {
+                    const scol = tableColToSourceCol.get(tcol);
+                    return scol !== undefined && trialClosure.has(scol);
+                });
+            });
+            if (stillCovers) minimalSourceCols.delete(c);
         }
+
+        // Translate minimal source cols back to table reference's column indices.
+        // A source col may not map back to this table (could be from a join sibling);
+        // those are dropped — they don't belong to this reference's group key.
+        const sourceColToTableCol = new Map<number, number>();
+        for (const [tcol, scol] of tableColToSourceCol) {
+            sourceColToTableCol.set(scol, tcol);
+        }
+        const minimalTableCols: number[] = [];
+        for (const scol of minimalSourceCols) {
+            const tcol = sourceColToTableCol.get(scol);
+            if (tcol !== undefined) minimalTableCols.push(tcol);
+        }
+        minimalTableCols.sort((a, b) => a - b);
+
+        classifications.set(relKey, 'group');
+        groupKeys.set(relKey, minimalTableCols);
     }
 
     // Recurse into the aggregate's source for further nested identity-breaking nodes
-    demoteForIdentityBreakingNodes(aggNode.source as unknown as PlanNode, classifications, tableInfos);
-}
-
-function combineResiduals(predicates: ScalarPlanNode[]): ScalarPlanNode | undefined {
-    if (predicates.length === 0) return undefined;
-    if (predicates.length === 1) return predicates[0];
-    let acc = predicates[0];
-    for (let i = 1; i < predicates.length; i++) {
-        const right = predicates[i];
-        const ast: AST.BinaryExpr = { type: 'binary', operator: 'AND', left: (acc as any).expression, right: (right as any).expression };
-        acc = new BinaryOpNode((acc as any).scope, ast, acc, right);
-    }
-    return acc;
-}
-
-/**
- * Walk a plan tree and call callback for each predicate found
- */
-function walkPlanForPredicates(
-  plan: PlanNode,
-  callback: (predicate: ScalarPlanNode, sourceNode: string) => void
-): void {
-  if (!plan) return;
-  // If node exposes predicates via characteristic, collect them
-  if (CapabilityDetectors.isPredicateSource(plan as any)) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const preds = (plan as any).getPredicates() as ReadonlyArray<ScalarPlanNode>;
-    for (const p of preds) {
-      callback(p, 'PredicateSource');
-    }
-  }
-
-  // Recurse into all children (scalar and relational)
-  for (const child of plan.getChildren()) {
-    walkPlanForPredicates(child as unknown as PlanNode, callback);
-  }
+    classifyForIdentityBreakingNodes(aggNode.source as unknown as PlanNode, classifications, groupKeys, tableInfos);
 }
 
 /**
@@ -1127,7 +1540,7 @@ function createTableInfosFromPlan(plan: RelationalPlanNode | PlanNode): TableInf
   const seen = new Set<string>();
 
   function visitAny(node: PlanNode): void {
-    const id = (node as any).id ?? null;
+    const id = node.id ?? null;
     if (id !== null) {
       const k = String(id);
       if (seen.has(k)) return;
@@ -1170,15 +1583,43 @@ export function createTableInfoFromNode(node: RelationalPlanNode, relationName?:
 		? relType.keys.map(key => key.map(ref => ref.index))
 		: undefined;
 
+	// Pull FDs / equivalence classes from the node's physical properties so callers can
+	// expand the equality-covered column set under FD closure. Falling back to undefined
+	// when the node hasn't materialized them keeps behaviour equivalent to the prior
+	// non-closure path.
+	const physical = (node as unknown as { physical?: { fds?: readonly FunctionalDependency[]; equivClasses?: readonly (readonly number[])[] } }).physical;
+	const fds = physical?.fds;
+	const equivClasses = physical?.equivClasses;
+
+	// Candidate keys come from the unified `keysOf` surface, which reconciles
+	// declared keys, FD-derived keys, the `∅ → all_cols` ≤1-row empty key, and
+	// the all-columns set key. This is what lets a reference whose uniqueness is
+	// provable only through `physical.fds` (e.g. an FD-derived key or a singleton
+	// FD on a no-PK table) classify as 'row'/'group' rather than 'global'.
+	// `node` already satisfies KeyRel (getType() + physical?).
+	const candidateKeys = keysOf(node as unknown as KeyRel).map(k => [...k]);
+
 	const relName = relationName || node.toString();
-	const relationKey = `${relName}#${(node as any).id ?? 'unknown'}`;
+	// Canonicalize the instance key to lowercase. SQL identifiers are
+	// case-insensitive, and every other relation-key builder in the
+	// change-scope pipeline lowercases (`change-scope.ts` relKeyFor,
+	// `binding-extractor.ts` collectTableRefs, `collectRelationKeysBeneath`,
+	// `key-filter.ts`). Leaving this one un-lowercased meant a table whose
+	// name isn't already lowercase (e.g. `Entity`) produced a relationKey
+	// that no other site matched — so `analyzeRowSpecific`'s classification
+	// and `extractConstraintsForTable`'s filter both missed, silently
+	// widening every single-PK equality select to a whole-table scope.
+	const relationKey = `${relName.toLowerCase()}#${node.id ?? 'unknown'}`;
 
 	return {
 		relationName: relName,
 		relationKey,
 		attributes: attributes.map(attr => ({ id: attr.id, name: attr.name })),
 		columnIndexMap,
-		uniqueKeys
+		uniqueKeys,
+		candidateKeys,
+		fds,
+		equivClasses
 	};
 }
 

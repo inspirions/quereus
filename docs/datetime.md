@@ -1,5 +1,7 @@
 # Date and Time Handling in Quereus
 
+> **Stability: Stable** — see [Stability Tiers](stability.md#tiers).
+
 ## SQL Date/Time Functions
 
 The built-in SQL functions (`date`, `time`, `datetime`, `julianday`, `strftime`) are analogues to SQLite's functions. The `epoch_s`, `epoch_ms`, and `epoch_s_frac` functions provide first-class Unix epoch support.
@@ -39,6 +41,30 @@ The functions attempt to parse the initial time string argument (`timestring`) l
     *   **Unix Epoch:** Other numbers are typically interpreted as seconds since the Unix epoch (1970-01-01 00:00:00 UTC). If the `unixepoch` modifier is used, the number *must* be interpreted as Unix epoch seconds. Ambiguity between large millisecond timestamps and seconds is resolved by prioritizing seconds if the value falls within a reasonable range (approx. 1900-3000 AD).
 
 If parsing fails for any reason, the function generally returns `NULL`.
+
+**Canonicalization for stored column values** (separate from the lenient
+SQL-function parsing above): when a value is written into a `DATE`, `TIME`, or
+`DATETIME` column, the column's logical type normalizes the input to a single
+canonical shape so that equal instants compare equal regardless of how they
+were written. For `DATETIME` the canonical form is the bare PlainDateTime
+string (`YYYY-MM-DDTHH:MM:SS[.sss]`) in **UTC** — an input with `Z`, a `±HH:MM`
+offset, a `[zone]` annotation, or a numeric Unix-millisecond value is
+converted to UTC before the zone information is discarded. The SQL functions
+listed above retain their existing lenient behavior; only the column-type
+`parse` performs this canonicalization.
+
+Canonicalization applies **only to the stored value**, not to a comparison
+literal on the read/filter path. A literal in a predicate (`WHERE ts = '…'`) is
+compared **raw** (BINARY, byte-for-byte) against the stored canonical value — it
+is not parsed or canonicalized first. So a non-canonical literal that denotes the
+*same instant* as a stored row does **not** match: `WHERE ts = '2017-07-14T02:40:00Z'`
+returns nothing against a row stored as the bare `'2017-07-14T02:40:00'`, even
+though both name the same time; only the bare canonical literal
+`'2017-07-14T02:40:00'` matches. Range predicates likewise order raw, so the bare
+form (a strict prefix of the `Z`-suffixed form) sorts below it. To match reliably,
+write the literal in the column's canonical shape (or wrap it so it is stored/cast
+first). This raw-comparison contract is pinned by the `dt_filter` / `d_filter` /
+`t_filter` cases in `test/logic/98-temporal-edge-cases.sqllogic`.
 
 ### Strict Parsing (Epoch Functions)
 

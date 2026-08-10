@@ -93,6 +93,44 @@ SELECT l.id, r.id FROM mj_nocase_l l JOIN mj_nocase_r r ON l.name = r.name ORDER
 SELECT l.id, l.name, r.id AS rid FROM mj_nocase_l l LEFT JOIN mj_nocase_r r ON l.name = r.name ORDER BY l.id;
 → [{"id":1,"name":"Alice","rid":10},{"id":2,"name":"Bob","rid":20},{"id":3,"name":"Charlie","rid":null}]
 
+-- Asymmetric collation (ticket join-key-collation-resolution-alignment): left
+-- defaults to BINARY, right declares NOCASE. equi-pair-extractor's matched-collation
+-- gate (deliberately kept conservative because the physical ordering property is
+-- collation-blind) demotes this asymmetric pair to the residual, so the join runs
+-- as a nested loop — but the comparison still resolves to NOCASE via the shared
+-- lattice (declared outranks defaulted BINARY), so the result is IDENTICAL to the
+-- symmetric NOCASE join above. The mirror spelling is the regression-prone case
+-- the old left-first emitter rules would have compared under BINARY.
+CREATE TABLE mj_mix_l (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE mj_mix_r (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE);
+INSERT INTO mj_mix_l VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+INSERT INTO mj_mix_r VALUES (10, 'alice'), (20, 'BOB'), (30, 'Dave');
+
+SELECT l.id, r.id FROM mj_mix_l l JOIN mj_mix_r r ON l.name = r.name ORDER BY l.id;
+→ [{"id":1,"id:1":10},{"id":2,"id:1":20}]
+
+DROP TABLE mj_mix_l;
+DROP TABLE mj_mix_r;
+
+-- Real MergeJoin over NOCASE text PK keys: both sides are PK-ordered on a NOCASE
+-- column, so this is an actual MergeJoin (the mj_nocase ON-name join above is a
+-- hash join — name is not ordered there). Exercises the merge emitter's resolved
+-- comparator: the inputs are sorted under NOCASE and the key comparison resolves
+-- to NOCASE through the same lattice, so case-variant keys match in lockstep.
+CREATE TABLE mj_ci_pk_l (name TEXT COLLATE NOCASE PRIMARY KEY, v INTEGER);
+CREATE TABLE mj_ci_pk_r (name TEXT COLLATE NOCASE PRIMARY KEY, w INTEGER);
+INSERT INTO mj_ci_pk_l VALUES ('Alice', 1), ('Bob', 2), ('Carol', 3);
+INSERT INTO mj_ci_pk_r VALUES ('alice', 10), ('BOB', 20), ('dave', 30);
+
+SELECT node_type FROM query_plan('SELECT * FROM mj_ci_pk_l l JOIN mj_ci_pk_r r ON l.name = r.name') WHERE node_type LIKE '%Join%';
+→ [{"node_type":"MergeJoin"}]
+
+SELECT l.v, r.w FROM mj_ci_pk_l l JOIN mj_ci_pk_r r ON l.name = r.name ORDER BY l.v;
+→ [{"v":1,"w":10},{"v":2,"w":20}]
+
+DROP TABLE mj_ci_pk_l;
+DROP TABLE mj_ci_pk_r;
+
 -- ===== PK-equi-join tests (trigger MergeJoin via inherent PK ordering) =====
 
 -- Setup: single-column PK tables
@@ -173,6 +211,57 @@ DROP TABLE mj_pk_b;
 DROP TABLE mj_mc_pk1;
 DROP TABLE mj_mc_pk2;
 DROP TABLE mj_pk_empty;
+
+-- ===== Monotonic-merge recognition tests =====
+-- These cover the broader "MonotonicOn on equi-pair" recognition (rule:
+-- monotonic-merge-join). The headline case is a three-way join where the
+-- middle MergeJoin's output advertises MonotonicOn on both equi-pair
+-- attributes (left and right ids), but `physical.ordering` only reflects
+-- the left side; the parent join on the right side's id therefore depends
+-- on the MonotonicOn-aware rule rather than ordering-prefix matching.
+
+CREATE TABLE mm_t1 (id INTEGER PRIMARY KEY, x TEXT);
+CREATE TABLE mm_t2 (id INTEGER PRIMARY KEY, y TEXT);
+CREATE TABLE mm_t3 (id INTEGER PRIMARY KEY, z TEXT);
+INSERT INTO mm_t1 VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d');
+INSERT INTO mm_t2 VALUES (1,'x'),(2,'y'),(3,'z');
+INSERT INTO mm_t3 VALUES (1,'p'),(3,'r'),(4,'s');
+
+-- Plan shape: three-way join must use MergeJoin at both join levels.
+SELECT count(*) AS cnt FROM query_plan('SELECT * FROM mm_t1 JOIN mm_t2 ON mm_t1.id = mm_t2.id JOIN mm_t3 ON mm_t2.id = mm_t3.id') WHERE node_type = 'MergeJoin';
+→ [{"cnt":2}]
+
+-- Three-way INNER JOIN correctness
+SELECT mm_t1.id, x, y, z FROM mm_t1 JOIN mm_t2 ON mm_t1.id = mm_t2.id JOIN mm_t3 ON mm_t2.id = mm_t3.id ORDER BY mm_t1.id;
+→ [{"id":1,"x":"a","y":"x","z":"p"},{"id":3,"x":"c","y":"z","z":"r"}]
+
+-- Multi-conjunct ON where only id is monotonic on both sides; the second
+-- conjunct (l.code = r.code) is evaluated as residual without breaking
+-- correctness.
+CREATE TABLE mm_a (id INTEGER PRIMARY KEY, code INTEGER, label TEXT);
+CREATE TABLE mm_b (id INTEGER PRIMARY KEY, code INTEGER, info TEXT);
+INSERT INTO mm_a VALUES (1,100,'a'),(2,200,'b'),(3,200,'c');
+INSERT INTO mm_b VALUES (1,100,'x'),(2,250,'y'),(3,200,'z');
+
+SELECT a.id, label, info FROM mm_a a JOIN mm_b b ON a.id = b.id AND a.code = b.code ORDER BY a.id;
+→ [{"id":1,"label":"a","info":"x"},{"id":3,"label":"c","info":"z"}]
+
+-- LEFT JOIN with the monotonic-merge rule firing
+SELECT mm_t1.id, x, y FROM mm_t1 LEFT JOIN mm_t2 ON mm_t1.id = mm_t2.id ORDER BY mm_t1.id;
+→ [{"id":1,"x":"a","y":"x"},{"id":2,"x":"b","y":"y"},{"id":3,"x":"c","y":"z"},{"id":4,"x":"d","y":null}]
+
+-- SEMI / ANTI join via EXISTS / NOT EXISTS over monotonic equi-pair
+SELECT mm_t1.id FROM mm_t1 WHERE EXISTS (SELECT 1 FROM mm_t2 WHERE mm_t2.id = mm_t1.id) ORDER BY mm_t1.id;
+→ [{"id":1},{"id":2},{"id":3}]
+
+SELECT mm_t1.id FROM mm_t1 WHERE NOT EXISTS (SELECT 1 FROM mm_t2 WHERE mm_t2.id = mm_t1.id) ORDER BY mm_t1.id;
+→ [{"id":4}]
+
+DROP TABLE mm_t1;
+DROP TABLE mm_t2;
+DROP TABLE mm_t3;
+DROP TABLE mm_a;
+DROP TABLE mm_b;
 
 -- Cleanup
 DROP TABLE mj_left;

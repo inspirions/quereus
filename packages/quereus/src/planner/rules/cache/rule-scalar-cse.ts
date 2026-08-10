@@ -10,7 +10,7 @@
  * - Skip bare column references and literals (cost 0, cheap to recompute)
  * - Require at least 2 occurrences of the same fingerprint
  *
- * Pass: Structural (top-down), priority 22
+ * Pass: Structural (top-down)
  * Node type: PlanNodeType.Project
  */
 
@@ -60,6 +60,12 @@ function collectSubexpressions(
 	}
 	// Skip non-deterministic expressions
 	if (root.physical.deterministic === false) {
+		return;
+	}
+	// Skip side-effect-bearing expressions: deduplicating N copies of a
+	// `(insert ... returning ...)` scalar into a single shared computation
+	// would silently change the number of writes.
+	if (root.physical.readonly === false) {
 		return;
 	}
 	// Skip parameter references - cheap to evaluate
@@ -268,7 +274,8 @@ export function ruleScalarCSE(node: PlanNode, _context: OptContext): PlanNode | 
 		if (expr.nodeType !== PlanNodeType.ColumnReference &&
 			expr.nodeType !== PlanNodeType.Literal &&
 			expr.nodeType !== PlanNodeType.ParameterReference &&
-			expr.physical.deterministic !== false) {
+			expr.physical.deterministic !== false &&
+			expr.physical.readonly !== false) {
 			const fp = fingerprintExpression(expr);
 			const rep = replacements.get(fp);
 			if (rep) {

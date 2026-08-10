@@ -3,12 +3,18 @@
  *
  * Required Characteristics:
  * - Node must be a logical JoinNode (not already a physical join)
- * - Node must have an equi-join predicate for hash/merge join consideration
+ * - Node must have an equi-join predicate for hash/merge/index-NL consideration
+ * - Neither side may read the other's columns (such a side must keep the
+ *   nested-loop driver — hash/merge drain one side before the other's rows exist)
  *
  * Applied When:
- * - Logical JoinNode with equi-join predicates where hash or merge join is cheaper than nested loop
+ * - Logical JoinNode with equi-join predicates where hash join, merge join, or
+ *   an index-nested-loop (per-outer-row seek into the inner side, built by
+ *   `index-nested-loop.ts`) is cheaper than the plain nested loop
  *
- * Benefits: Replaces O(n*m) nested loop with O(n+m) hash/merge join for equi-joins
+ * Benefits: Replaces the O(n*m) nested loop with an O(n+m) hash/merge join, or
+ * with an O(n·seek) index-nested-loop when the inner side's module can answer
+ * an equality seek on the join key
  */
 
 import { createLogger } from '../../../common/logger.js';
@@ -18,142 +24,19 @@ import { JoinNode } from '../../nodes/join-node.js';
 import { BloomJoinNode, type EquiJoinPair } from '../../nodes/bloom-join-node.js';
 import { MergeJoinNode } from '../../nodes/merge-join-node.js';
 import { SortNode } from '../../nodes/sort.js';
-import { BinaryOpNode } from '../../nodes/scalar.js';
 import { ColumnReferenceNode } from '../../nodes/reference.js';
-import { normalizePredicate } from '../../analysis/predicate-normalizer.js';
 import { nestedLoopJoinCost, hashJoinCost, mergeJoinCost } from '../../cost/index.js';
+import {
+	extractEquiPairs,
+	isOrderedOnEquiPairs,
+	reorderEquiPairsForMerge,
+} from './equi-pair-extractor.js';
 import { PlanNodeCharacteristics } from '../../framework/characteristics.js';
+import { readsColumnsOf } from '../../cache/correlation-detector.js';
+import { physicalSourceRows } from '../../util/row-estimates.js';
+import { tryIndexNestedLoop } from './index-nested-loop.js';
 
 const log = createLogger('optimizer:rule:join-physical-selection');
-
-/**
- * Extract equi-join pairs and residual predicates from an ON condition.
- * Returns null if no equi-pairs found.
- */
-function extractEquiPairs(
-	condition: ScalarPlanNode | undefined,
-	leftAttrIds: Set<number>,
-	rightAttrIds: Set<number>
-): { equiPairs: EquiJoinPair[]; residual: ScalarPlanNode | undefined } | null {
-	if (!condition) return null;
-
-	const norm = normalizePredicate(condition);
-	const equiPairs: EquiJoinPair[] = [];
-	const residuals: ScalarPlanNode[] = [];
-
-	// Walk AND-tree and classify each conjunct
-	const stack: ScalarPlanNode[] = [norm];
-	while (stack.length) {
-		const n = stack.pop()!;
-		if (n instanceof BinaryOpNode && n.expression.operator === 'AND') {
-			stack.push(n.left, n.right);
-			continue;
-		}
-
-		// Check for equi-join: col_ref = col_ref across left/right
-		let isEqui = false;
-		if (n instanceof BinaryOpNode && n.expression.operator === '=') {
-			if (n.left instanceof ColumnReferenceNode && n.right instanceof ColumnReferenceNode) {
-				const lId = n.left.attributeId;
-				const rId = n.right.attributeId;
-
-				if (leftAttrIds.has(lId) && rightAttrIds.has(rId)) {
-					equiPairs.push({ leftAttrId: lId, rightAttrId: rId });
-					isEqui = true;
-				} else if (leftAttrIds.has(rId) && rightAttrIds.has(lId)) {
-					equiPairs.push({ leftAttrId: rId, rightAttrId: lId });
-					isEqui = true;
-				}
-			}
-		}
-
-		if (!isEqui) {
-			residuals.push(n);
-		}
-	}
-
-	if (equiPairs.length === 0) return null;
-
-	// Combine residuals back into an AND-tree
-	let residual: ScalarPlanNode | undefined;
-	if (residuals.length > 0) {
-		residual = residuals.reduce((acc, cur) =>
-			new BinaryOpNode(cur.scope, { type: 'binary', operator: 'AND' } as any, acc, cur)
-		);
-	}
-
-	return { equiPairs, residual };
-}
-
-/**
- * Check if a source's ordering covers the given equi-pair columns.
- * Returns true if the source is already sorted ascending on the equi-pair
- * columns in the exact order the equi-pairs specify.  Positional matching
- * is required because the merge-join emitter compares keys in equi-pair
- * order; a mismatch (e.g. source sorted (b, a) vs equi-pairs (a, b))
- * would break the linear-scan invariant.
- */
-function isOrderedOnEquiPairs(
-	source: RelationalPlanNode,
-	equiPairs: readonly EquiJoinPair[],
-	side: 'left' | 'right'
-): boolean {
-	const ordering = PlanNodeCharacteristics.getOrdering(source);
-	if (!ordering || ordering.length === 0) return false;
-	if (equiPairs.length > ordering.length) return false;
-
-	const attrs = source.getAttributes();
-
-	for (let i = 0; i < equiPairs.length; i++) {
-		const attrId = side === 'left' ? equiPairs[i].leftAttrId : equiPairs[i].rightAttrId;
-		const idx = attrs.findIndex(a => a.id === attrId);
-		if (idx === -1) return false;
-
-		// Ordering entry at position i must match this equi-pair column and
-		// must be ascending (merge join's compareKeys assumes ASC order).
-		if (ordering[i].column !== idx || ordering[i].desc) return false;
-	}
-
-	return true;
-}
-
-/**
- * Reorder equi-pairs to match the left source's physical ordering prefix.
- * The merge-join emitter compares keys in equi-pair order, so the pairs
- * must align with both sources' sort order.  Returns null if the pairs
- * cannot be reordered to match both sides simultaneously.
- */
-function reorderEquiPairsForMerge(
-	equiPairs: readonly EquiJoinPair[],
-	left: RelationalPlanNode,
-	right: RelationalPlanNode
-): EquiJoinPair[] | null {
-	const leftOrdering = PlanNodeCharacteristics.getOrdering(left);
-	if (!leftOrdering || leftOrdering.length < equiPairs.length) return null;
-
-	const leftAttrs = left.getAttributes();
-
-	// Build a map from left column index → equi-pair index
-	const colToEqIdx = new Map<number, number>();
-	for (let i = 0; i < equiPairs.length; i++) {
-		const attrIdx = leftAttrs.findIndex(a => a.id === equiPairs[i].leftAttrId);
-		if (attrIdx === -1) return null;
-		colToEqIdx.set(attrIdx, i);
-	}
-
-	// Reorder to match the left ordering prefix
-	const reordered: EquiJoinPair[] = [];
-	for (let i = 0; i < equiPairs.length; i++) {
-		const eqIdx = colToEqIdx.get(leftOrdering[i].column);
-		if (eqIdx === undefined || leftOrdering[i].desc) return null;
-		reordered.push(equiPairs[eqIdx]);
-	}
-
-	// Verify the reordered pairs also match the right source's ordering
-	if (!isOrderedOnEquiPairs(right, reordered, 'right')) return null;
-
-	return reordered;
-}
 
 /**
  * Create a SortNode that sorts a source on the equi-pair columns for this side.
@@ -165,14 +48,15 @@ function createSortForEquiPairs(
 	scope: import('../../scopes/scope.js').Scope
 ): RelationalPlanNode {
 	const attrs = source.getAttributes();
+	const attrIndex = source.getAttributeIndex();
 	const sortKeys = equiPairs.map(pair => {
 		const attrId = side === 'left' ? pair.leftAttrId : pair.rightAttrId;
-		const idx = attrs.findIndex(a => a.id === attrId);
+		const idx = attrIndex.get(attrId) ?? -1;
 		const attr = attrs[idx];
 		// Create a ColumnReferenceNode for this attribute
 		const colRef = new ColumnReferenceNode(
 			scope,
-			{ type: 'column', table: '', column: attr.name, schema: '' } as any,
+			{ type: 'column', table: '', name: attr.name, schema: '' },
 			attr.type,
 			attr.id,
 			idx
@@ -186,7 +70,7 @@ function createSortForEquiPairs(
 	return new SortNode(scope, source, sortKeys);
 }
 
-export function ruleJoinPhysicalSelection(node: PlanNode, _context: OptContext): PlanNode | null {
+export function ruleJoinPhysicalSelection(node: PlanNode, context: OptContext): PlanNode | null {
 	// Guard: only apply to logical JoinNode, not already-physical nodes
 	if (!(node instanceof JoinNode)) return null;
 
@@ -201,39 +85,80 @@ export function ruleJoinPhysicalSelection(node: PlanNode, _context: OptContext):
 	const leftAttrIds = new Set(leftAttrs.map(a => a.id));
 	const rightAttrIds = new Set(rightAttrs.map(a => a.id));
 
-	// Try to extract equi-join pairs from condition (or USING)
-	let extracted: { equiPairs: EquiJoinPair[]; residual: ScalarPlanNode | undefined } | null = null;
-
-	if (node.condition) {
-		extracted = extractEquiPairs(node.condition, leftAttrIds, rightAttrIds);
-	} else if (node.usingColumns) {
-		// Convert USING columns to equi-pairs
-		const equiPairs: EquiJoinPair[] = [];
-		for (const colName of node.usingColumns) {
-			const lowerName = colName.toLowerCase();
-			const leftAttr = leftAttrs.find(a => a.name.toLowerCase() === lowerName);
-			const rightAttr = rightAttrs.find(a => a.name.toLowerCase() === lowerName);
-			if (leftAttr && rightAttr) {
-				equiPairs.push({ leftAttrId: leftAttr.id, rightAttrId: rightAttr.id });
-			}
-		}
-		if (equiPairs.length > 0) {
-			extracted = { equiPairs, residual: undefined };
-		}
-	}
+	// Try to extract equi-join pairs from the condition. A USING join has one too —
+	// `buildUsingCondition` desugars it at build time — so there is no separate path.
+	const extracted: { equiPairs: EquiJoinPair[]; residual: ScalarPlanNode | undefined } | null =
+		extractEquiPairs(node.condition, leftAttrIds, rightAttrIds);
 
 	if (!extracted || extracted.equiPairs.length === 0) return null;
 
-	// Cost comparison: nested loop vs hash join vs merge join
-	const leftRows = node.left.estimatedRows ?? 100;
-	const rightRows = node.right.estimatedRows ?? 100;
+	// A side that reads its sibling's columns must keep the nested-loop driver.
+	// LATERAL is a parsed, supported join form, so `join lateral (…) on
+	// <equality>` reaches this rule with a right side reading left columns —
+	// converting it to a hash join raised "No row context found" at runtime.
+	// This is also what makes the index-nested-loop rewrite below idempotent:
+	// its own output seeks on left-side column references.
+	if (readsColumnsOf(node.right, node.left) || readsColumnsOf(node.left, node.right)) {
+		log('Declining: a join side reads its sibling\'s columns; nested-loop driver required');
+		return null;
+	}
+
+	// Cost comparison: nested loop vs hash join vs merge join vs index-nested-loop.
+	// Physical relay first: by PostOptimization both sides are physical access
+	// nodes (or wrappers over them) which declare no logical `estimatedRows`
+	// getter — the catalog-derived count lives in `physical.estimatedRows` (see
+	// planner/util/row-estimates.ts). `||` not `??`: 0 is the un-analyzed
+	// "unknown" sentinel, not "empty" (same collapse rule-select-access-path
+	// applies), so an un-analyzed table costs exactly as it did under the old
+	// logical-getter read (which yielded undefined → 100).
+	const leftRows = physicalSourceRows(node.left.physical, node.left) || 100;
+	const rightRows = physicalSourceRows(node.right.physical, node.right) || 100;
 
 	const nlCost = nestedLoopJoinCost(leftRows, rightRows);
+
+	// Index-nested-loop candidate: the logical JoinNode survives with its right
+	// leaf replaced by a per-outer-row correlated IndexSeek. Considered BEFORE
+	// the existence early-return below — index-NL keeps the nested-loop emitter
+	// (the only one that derives `exists … as` flag bits) and `withChildren`
+	// threads `existence` verbatim, so existence joins CAN take this path,
+	// unlike hash/merge which drop the appended flag column.
+	const indexNL = tryIndexNestedLoop(node, extracted.equiPairs, leftRows, context);
+
+	// Rebuild with the seek-bearing right side, KEEPING the ON condition on the
+	// join. It is redundant when the seek is exact, but it is the safety net
+	// when the seek over-fetches (a COARSER_SAFE collation cover, a module
+	// returning a superset) — and it costs one predicate evaluation per emitted
+	// row, not per scanned row.
+	const rebuildWithIndexNL = (): PlanNode => {
+		log('Selecting index-nested-loop join (cost=%.2f) for %d outer rows', indexNL!.cost, leftRows);
+		// `condition` is defined — equi pairs were extracted from it above.
+		return node.withChildren([node.left, indexNL!.newRight, node.condition!]);
+	};
+
+	// A join exposing `exists … as` match flags stays the nested-loop JoinNode (the
+	// only emitter that derives the flag bit); the physical Bloom/Merge variants do
+	// not carry or emit the appended flag column, so converting would drop it. Read
+	// half: existence joins forgo hash/merge selection — documented limitation.
+	// Index-NL remains available (see above): only plain NL and index-NL compete.
+	if (node.hasExistenceColumns) {
+		if (indexNL && indexNL.cost < nlCost) return rebuildWithIndexNL();
+		return null;
+	}
 
 	// Hash join cost: build side is the smaller input
 	const buildRows = Math.min(leftRows, rightRows);
 	const probeRows = Math.max(leftRows, rightRows);
 	const hashCostValue = hashJoinCost(buildRows, probeRows);
+
+	// Merge join is a candidate only when EVERY pair has matched declared
+	// collations: merge needs both inputs physically ordered under the key's
+	// comparison collation, and the ordering property is collation-blind — a
+	// matched declared collation is what makes each input's advertised order
+	// equal the merge comparator's order (see EquiJoinPair.collationsMatch).
+	// Any mismatched pair ⇒ merge unavailable; hash vs nested-loop compete.
+	// (Merging on just the matched subset would be sound but is deliberately
+	// not attempted — rare shape, minimal-change tradeoff.)
+	const mergeAvailable = extracted.equiPairs.every(p => p.collationsMatch);
 
 	// Merge join cost: depends on whether inputs are already sorted.
 	// Try reordering equi-pairs to match the source orderings first.
@@ -248,30 +173,55 @@ export function ruleJoinPhysicalSelection(node: PlanNode, _context: OptContext):
 			rightOrdered = true;
 		}
 	}
-	const mergeCostValue = mergeJoinCost(leftRows, rightRows, !leftOrdered, !rightOrdered);
+	const mergeCostValue = mergeAvailable
+		? mergeJoinCost(leftRows, rightRows, !leftOrdered, !rightOrdered)
+		: Infinity;
+
+	// Hash and merge each scan the inner side once, so the inner subtree's
+	// first-row latency is charged ONCE to each — locally here, not in the
+	// shared cost functions (which other callers use latency-free). Index-NL's
+	// formula charges it per outer row (per seek). Plain nested-loop's formula
+	// is deliberately left alone: it is the no-change fallback, and if it wins
+	// nothing is rewritten.
+	//
+	// NOTE: that last exemption biases against index-NL once a module reports a
+	// nonzero `expectedLatencyMs` — plain NL re-opens the right side per outer
+	// row too, so it pays the same per-seek latency but is charged none, and can
+	// win a comparison against the strictly cheaper index-NL. Harmless today
+	// (both shipped modules report 0). If a high-latency module appears, charge
+	// plain NL `outerRows * latency` here rather than dropping it from index-NL.
+	const rightLatencyMs = node.right.physical.expectedLatencyMs ?? 0;
 
 	// Pick the cheapest physical join algorithm
-	type JoinAlgo = 'nested-loop' | 'hash' | 'merge';
+	type JoinAlgo = 'nested-loop' | 'hash' | 'merge' | 'index-nl';
 	let bestAlgo: JoinAlgo = 'nested-loop';
 	let bestCost = nlCost;
 
-	if (hashCostValue < bestCost) {
+	if (hashCostValue + rightLatencyMs < bestCost) {
 		bestAlgo = 'hash';
-		bestCost = hashCostValue;
+		bestCost = hashCostValue + rightLatencyMs;
 	}
-	if (mergeCostValue < bestCost) {
+	if (mergeCostValue + rightLatencyMs < bestCost) {
 		bestAlgo = 'merge';
-		bestCost = mergeCostValue;
+		bestCost = mergeCostValue + rightLatencyMs;
+	}
+	if (indexNL && indexNL.cost < bestCost) {
+		bestAlgo = 'index-nl';
+		bestCost = indexNL.cost;
 	}
 
 	if (bestAlgo === 'nested-loop') {
-		log('Nested loop cheapest (nl=%.2f, hash=%.2f, merge=%.2f) for %d x %d rows',
-			nlCost, hashCostValue, mergeCostValue, leftRows, rightRows);
+		log('Nested loop cheapest (nl=%.2f, hash=%.2f, merge=%.2f, indexNL=%.2f) for %d x %d rows',
+			nlCost, hashCostValue, mergeCostValue, indexNL?.cost ?? Infinity, leftRows, rightRows);
 		return null;
 	}
 
-	log('Selecting %s join (nl=%.2f, hash=%.2f, merge=%.2f) for %d x %d rows',
-		bestAlgo, nlCost, hashCostValue, mergeCostValue, leftRows, rightRows);
+	if (bestAlgo === 'index-nl') {
+		return rebuildWithIndexNL();
+	}
+
+	log('Selecting %s join (nl=%.2f, hash=%.2f, merge=%.2f, indexNL=%.2f) for %d x %d rows',
+		bestAlgo, nlCost, hashCostValue, mergeCostValue, indexNL?.cost ?? Infinity, leftRows, rightRows);
 
 	// Preserve attribute IDs from the logical JoinNode
 	const preserveAttrs = node.getAttributes().slice() as Attribute[];
@@ -290,6 +240,10 @@ export function ruleJoinPhysicalSelection(node: PlanNode, _context: OptContext):
 			log('Inserted right sort for merge join');
 		}
 
+		// NOTE: merge takes `preserveAttrs` unpermuted because it never swaps its
+		// sides — the sort wrappers preserve each child's attribute order, so
+		// logical-left-then-right IS the emitted layout here. If merge ever grows a
+		// side swap, it needs the same permutation the hash path does below.
 		return new MergeJoinNode(
 			node.scope,
 			leftSource,
@@ -308,18 +262,42 @@ export function ruleJoinPhysicalSelection(node: PlanNode, _context: OptContext):
 	let probeSource = node.left;
 	let buildSource = node.right;
 	let equiPairs = extracted.equiPairs;
+	let hashAttrs = preserveAttrs;
 
 	// For INNER join, swap sides if left is smaller (becomes build side).
 	// For LEFT/SEMI/ANTI, left must remain probe to preserve semantics.
-	if (joinType === 'inner' && leftRows < rightRows) {
+	// Refuse to swap when either side carries a write — flipping build/probe
+	// reorders the user-visible execution order of side-effect subtrees.
+	if (joinType === 'inner' && leftRows < rightRows
+		&& !PlanNodeCharacteristics.subtreeHasSideEffects(node.left)
+		&& !PlanNodeCharacteristics.subtreeHasSideEffects(node.right)) {
 		// Swap: left becomes build, right becomes probe
 		probeSource = node.right;
 		buildSource = node.left;
-		// Flip equi-pair directions
+		// Flip equi-pair directions; spread so the collation flags survive.
 		equiPairs = extracted.equiPairs.map(p => ({
+			...p,
 			leftAttrId: p.rightAttrId,
 			rightAttrId: p.leftAttrId
 		}));
+		// INVARIANT: a physical join's advertised attribute order IS its emitted
+		// row layout. `emitBloomJoin` yields `[...leftRow, ...rightRow]` — that is,
+		// probe-then-build — and `getType()`, `combineJoinKeys` and
+		// `computePhysical`'s `leftAttrs.length` FD shift all describe the row the
+		// same way. So the preserved attributes must be permuted with the sides:
+		// same attribute IDs (which is all `preserveAttributeIds` guarantees —
+		// id stability, not position stability), new order. Skipping this makes
+		// any positional consumer that maps attribute id → column index through
+		// `getAttributes()` (e.g. `emitHashAggregate`'s scan row descriptor) read
+		// the wrong slot and silently return wrong values.
+		// The slice assumes `preserveAttrs` is exactly left++right, which the
+		// `joinType === 'inner'` test here and the `hasExistenceColumns` return
+		// above together guarantee — an existence join appends flag attributes
+		// after both sides and would need them left in place.
+		hashAttrs = [
+			...preserveAttrs.slice(leftAttrs.length),
+			...preserveAttrs.slice(0, leftAttrs.length),
+		];
 	}
 
 	return new BloomJoinNode(
@@ -329,6 +307,6 @@ export function ruleJoinPhysicalSelection(node: PlanNode, _context: OptContext):
 		joinType,
 		equiPairs,
 		extracted.residual,
-		preserveAttrs
+		hashAttrs
 	);
 }

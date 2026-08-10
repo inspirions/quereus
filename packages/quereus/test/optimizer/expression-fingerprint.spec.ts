@@ -14,8 +14,7 @@ import type { ScalarType } from '../../src/common/datatype.js';
 import { WindowFunctionCallNode } from '../../src/planner/nodes/window-function.js';
 import { ArrayIndexNode } from '../../src/planner/nodes/array-index-node.js';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-const scope = EmptyScope.instance as any;
+const scope = EmptyScope.instance;
 
 const textType: ScalarType = { typeClass: 'scalar', logicalType: TEXT_TYPE, nullable: false, isReadOnly: false };
 const intType: ScalarType = { typeClass: 'scalar', logicalType: INTEGER_TYPE, nullable: false, isReadOnly: false };
@@ -30,12 +29,12 @@ function lit(value: unknown): LiteralNode {
 }
 
 function binOp(op: string, left: ScalarPlanNode, right: ScalarPlanNode): BinaryOpNode {
-	const ast = { type: 'binary', operator: op, left: (left as any).expression, right: (right as any).expression } as AST.BinaryExpr;
+	const ast = { type: 'binary', operator: op, left: left.expression, right: right.expression } as AST.BinaryExpr;
 	return new BinaryOpNode(scope, ast, left, right);
 }
 
 function unaryOp(op: string, operand: ScalarPlanNode): UnaryOpNode {
-	const ast = { type: 'unary', operator: op, operand: (operand as any).expression } as unknown as AST.UnaryExpr;
+	const ast = { type: 'unary', operator: op, operand: operand.expression } as unknown as AST.UnaryExpr;
 	return new UnaryOpNode(scope, ast, operand);
 }
 
@@ -43,19 +42,19 @@ function makeFunctionSchema(name: string, deterministic: boolean): ScalarFunctio
 	return {
 		name,
 		numArgs: -1,
-		flags: deterministic ? FunctionFlags.DETERMINISTIC : 0,
+		flags: FunctionFlags.UTF8 | (deterministic ? FunctionFlags.DETERMINISTIC : 0),
 		returnType: textType,
 		implementation: () => null,
 	};
 }
 
 function fnCall(name: string, args: ScalarPlanNode[], deterministic = true): ScalarFunctionCallNode {
-	const expr = { type: 'function', name, args: args.map(a => (a as any).expression) } as unknown as AST.FunctionExpr;
+	const expr = { type: 'function', name, args: args.map(a => a.expression) } as unknown as AST.FunctionExpr;
 	return new ScalarFunctionCallNode(scope, expr, makeFunctionSchema(name, deterministic), args);
 }
 
 function aggCall(name: string, args: ScalarPlanNode[], distinct = false): AggregateFunctionCallNode {
-	const expr = { type: 'function', name, args: args.map(a => (a as any).expression) } as unknown as AST.FunctionExpr;
+	const expr = { type: 'function', name, args: args.map(a => a.expression) } as unknown as AST.FunctionExpr;
 	const schema: AggregateFunctionSchema = {
 		name,
 		numArgs: args.length,
@@ -483,6 +482,40 @@ describe('Expression fingerprinting', () => {
 			// Passing a Symbol or similar type that matches none of the type checks
 			const fp = fingerprintExpression(lit(Symbol('test')));
 			expect(fp).to.match(/^LI:\?/);
+		});
+
+		// JSON documents are the only OBJECT-class literal, and const-folding turns
+		// `json_col = '{"a":1}'` into one. `String(value)` renders every object as
+		// '[object Object]', which made CSE fold two DIFFERENT comparisons into one and
+		// silently drop a conjunct (`v = '{"a":1}' and v = '{"a":2}'` matched row 1).
+		describe('object (JSON) literals', () => {
+			it('structurally distinct documents fingerprint differently', () => {
+				expect(fingerprintExpression(lit({ a: 1 })))
+					.to.not.equal(fingerprintExpression(lit({ a: 2 })));
+				expect(fingerprintExpression(lit({ a: 1 })))
+					.to.not.equal(fingerprintExpression(lit({ b: 1 })));
+				expect(fingerprintExpression(lit([1, 2, 3])))
+					.to.not.equal(fingerprintExpression(lit([3, 2, 1])));
+			});
+
+			it('reorder-equal objects share a fingerprint (they are the same value)', () => {
+				expect(fingerprintExpression(lit({ a: 1, b: 2 })))
+					.to.equal(fingerprintExpression(lit({ b: 2, a: 1 })));
+			});
+
+			it('an object never collides with a same-looking string literal', () => {
+				expect(fingerprintExpression(lit({ a: 1 })))
+					.to.not.equal(fingerprintExpression(lit('{"a":1}')));
+			});
+
+			it('a non-serializable object falls back to a per-node fingerprint', () => {
+				const cyclic: Record<string, unknown> = {};
+				cyclic.self = cyclic;
+				const a = lit(cyclic);
+				const b = lit(cyclic);
+				expect(fingerprintExpression(a)).to.match(/^LI:\?/);
+				expect(fingerprintExpression(a)).to.not.equal(fingerprintExpression(b));
+			});
 		});
 	});
 

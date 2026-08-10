@@ -12,12 +12,49 @@ import type { ColumnReferenceNode } from '../nodes/reference.js';
  * that are not defined within its own scope.
  */
 export function isCorrelatedSubquery(subqueryNode: RelationalPlanNode): boolean {
-	// Collect all attributes defined within the subquery
+	// Short-circuit: stop at the first external reference rather than collecting all.
 	const definedAttributes = new Set<number>();
 	collectDefinedAttributes(subqueryNode, definedAttributes);
-
-	// Check if any column references use attributes not defined within the subquery
 	return hasExternalReferences(subqueryNode, definedAttributes);
+}
+
+/**
+ * Collect the attribute IDs the subquery references from *outer* scopes (i.e.
+ * not defined within its own subtree). An empty set means the subquery is not
+ * correlated. Used by rules that need to know *which* outer attributes a
+ * correlation depends on, not merely that it is correlated.
+ */
+export function collectExternalReferences(subqueryNode: RelationalPlanNode): Set<number> {
+	const definedAttributes = new Set<number>();
+	collectDefinedAttributes(subqueryNode, definedAttributes);
+	const external = new Set<number>();
+	collectExternalAttributeIds(subqueryNode, definedAttributes, external);
+	return external;
+}
+
+/**
+ * Does `reader` reference a column produced anywhere inside `producer`'s subtree?
+ *
+ * The question a join's physical-algorithm rules must ask before replacing the
+ * nested-loop driver: hash and merge each drain one side before (or
+ * independently of) the other's rows exist, so a side reading its SIBLING's
+ * columns — a `JOIN LATERAL` subtree, or an index-nested-loop's own correlated
+ * seek — resolves against no row at runtime. Correlation to a scope OUTSIDE the
+ * join is a different question ({@link isCorrelatedSubquery}) and not a hazard:
+ * the enclosing driver installs that row slot before the whole join opens.
+ *
+ * `producer`'s whole subtree counts, not merely the attributes it exposes at its
+ * top, so the answer cannot hinge on which of them survived to its output list.
+ */
+export function readsColumnsOf(reader: RelationalPlanNode, producer: RelationalPlanNode): boolean {
+	const external = collectExternalReferences(reader);
+	if (external.size === 0) return false;
+	const produced = new Set<number>();
+	collectDefinedAttributes(producer, produced);
+	for (const attrId of external) {
+		if (produced.has(attrId)) return true;
+	}
+	return false;
 }
 
 /**
@@ -80,4 +117,31 @@ function hasExternalReferences(node: PlanNode, definedAttributes: Set<number>): 
 	}
 
 	return false;
+}
+
+/**
+ * Like {@link hasExternalReferences}, but accumulates every external attribute
+ * ID into `external` instead of short-circuiting at the first one.
+ */
+function collectExternalAttributeIds(
+	node: PlanNode,
+	definedAttributes: Set<number>,
+	external: Set<number>,
+): void {
+	if (node.nodeType === PlanNodeType.ColumnReference) {
+		const colRef = node as ColumnReferenceNode;
+		if (!definedAttributes.has(colRef.attributeId)) {
+			external.add(colRef.attributeId);
+		}
+	}
+
+	for (const child of node.getChildren()) {
+		collectExternalAttributeIds(child, definedAttributes, external);
+	}
+
+	if (isRelationalNode(node)) {
+		for (const relation of node.getRelations()) {
+			collectExternalAttributeIds(relation, definedAttributes, external);
+		}
+	}
 }

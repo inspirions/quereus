@@ -1,10 +1,11 @@
 import type { RelationType } from '../../common/datatype.js';
-import { PlanNode, type RelationalPlanNode, type Attribute, type UnaryRelationalNode, ScalarPlanNode } from './plan-node.js';
+import { PlanNode, type RelationalPlanNode, type Attribute, type UnaryRelationalNode, ScalarPlanNode, type PhysicalProperties } from './plan-node.js';
 import { PlanNodeType } from './plan-node-type.js';
 import type { Scope } from '../scopes/scope.js';
 import type { TableReferenceNode } from './reference.js';
 import type { AnyVirtualTableModule } from '../../vtab/module.js';
 import { Cached } from '../../util/cached.js';
+import { physicalSourceRows } from '../util/row-estimates.js';
 
 /**
  * RetrieveNode represents the boundary between virtual table module execution and Quereus execution.
@@ -26,10 +27,19 @@ export class RetrieveNode extends PlanNode implements UnaryRelationalNode {
 		public readonly tableRef: TableReferenceNode,
 		/** Optional context data from the module's supports() assessment */
 		public readonly moduleCtx?: unknown,
-		/** Captured binding expressions used by the enveloped pipeline (params/correlated) */
+		/**
+		 * Captured binding expressions used by the enveloped pipeline (params/correlated).
+		 *
+		 * NOTE: deliberately NOT exposed via `getChildren` (OPT-009). No emitter reads them —
+		 * `runtime/emit/retrieve.ts` throws unconditionally, since a `RetrieveNode` is rewritten
+		 * to a physical access node before emission — so they are inert and merely go stale
+		 * after a rewrite. Expose them the moment an emitter reads them.
+		 */
 		public readonly bindings?: ReadonlyArray<ScalarPlanNode>
 	) {
-		super(scope, source.getTotalCost());
+		// Self-cost only: the source pipeline flows in via getChildren(). This node
+		// is just the module/Quereus execution boundary marker — negligible self cost.
+		super(scope, 0.01);
 		this.typeCache = new Cached(() => this.source.getType());
 	}
 
@@ -55,6 +65,34 @@ export class RetrieveNode extends PlanNode implements UnaryRelationalNode {
 
 	getRelations(): readonly [RelationalPlanNode] {
 		return [this.source];
+	}
+
+	/**
+	 * Pass-through propagation of the source pipeline's physical properties.
+	 * Retrieve is a marker for the module/Quereus execution boundary — its
+	 * output is bit-for-bit the source's output, so FDs/ECs/bindings/keys/
+	 * ordering all carry through unchanged. Without this override the default
+	 * physical accessor drops them at the boundary.
+	 */
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		const src = childrenPhysical[0];
+		if (!src) return {};
+		return {
+			estimatedRows: physicalSourceRows(src, this.source),
+			ordering: src.ordering,
+			monotonicOn: src.monotonicOn,
+			fds: src.fds,
+			equivClasses: src.equivClasses,
+			constantBindings: src.constantBindings,
+			domainConstraints: src.domainConstraints,
+			// Bit-for-bit pass-through includes the inclusion-dependency set — without
+			// this the INDs seeded at the table reference would be lost at the module
+			// boundary in every plan that wraps the access path in a Retrieve.
+			inds: src.inds,
+			// Backward update-lineage is part of the bit-for-bit pass-through.
+			updateLineage: src.updateLineage,
+			attributeDefaults: src.attributeDefaults,
+		};
 	}
 
 	/** Get the virtual table module for this retrieve node */

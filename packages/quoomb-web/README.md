@@ -1,5 +1,9 @@
 # Quoomb Web
 
+> **Stability: Beta** — complete and tested, but the surface is still being shaped; a
+> breaking change may land in a minor release. See
+> [Stability Tiers](../../docs/stability.md#tiers).
+
 **A browser-based interactive SQL playground and query interface for Quereus**
 
 Quoomb Web is a modern, React-based web application that provides a full-featured SQL development environment for the Quereus engine. It offers real-time query execution, visual query planning, plugin management, and advanced debugging capabilities—all running entirely in your browser.
@@ -17,6 +21,7 @@ Quoomb Web is a modern, React-based web application that provides a full-feature
 - **Execution Tracing** — Step-by-step execution visualization with performance metrics
 - **Cost Analysis** — Detailed cost estimation and optimization insights
 - **Scheduler Programs** — Low-level instruction inspection for deep performance analysis
+- **Schema ER Diagrams** — Mermaid ER diagrams generated from `declare schema` blocks in the active editor tab
 
 ### 🔌 **Plugin System**
 - **Dynamic Loading** — Install virtual table plugins from URLs at runtime
@@ -260,6 +265,17 @@ CREATE TABLE external_data USING json_table(
 3. Step through execution phases
 4. Analyze performance bottlenecks
 5. View instruction-level details
+
+#### Schema ER Diagram (ERD)
+1. Add one or more `declare schema` blocks in the active editor tab
+2. Open the **ERD** tab in the results panel
+3. Click **Refresh Diagram** to parse and regenerate from the latest editor content
+4. Pick any detected schema block from the block list (defaults to the last block)
+5. Switch Mermaid theme using the theme buttons (`default`, `neutral`, `dark`, `forest`, `base`)
+
+Notes:
+- Only `declare schema` statements are used for ERD generation; non-schema SQL is ignored.
+- ERD generation is explicit (tab open or refresh button), not auto-updated on every editor change.
 
 #### Keyboard Shortcuts
 - **Ctrl+Enter** — Execute selected query or current statement

@@ -12,9 +12,11 @@ import {
 	FunctionFlags,
 	createScalarFunction,
 	createTableValuedFunction,
+	scalarReturn,
+	TEXT_RETURN,
+	INTEGER_RETURN,
+	REAL_RETURN,
 	TEXT_TYPE,
-	INTEGER_TYPE,
-	REAL_TYPE,
 } from '@quereus/quereus';
 import type {
 	Database,
@@ -85,61 +87,47 @@ class KeyValueTable extends VirtualTable {
 	}
 }
 
-const stores = new Map<string, Map<string, string>>();
+const storesByDb = new WeakMap<Database, Map<string, Map<string, string>>>();
 
-function getOrCreateStore(schemaName: string, tableName: string): Map<string, string> {
+function getOrCreateStore(db: Database, schemaName: string, tableName: string): Map<string, string> {
+	let dbStores = storesByDb.get(db);
+	if (!dbStores) {
+		dbStores = new Map();
+		storesByDb.set(db, dbStores);
+	}
 	const key = `${schemaName}.${tableName}`.toLowerCase();
-	let store = stores.get(key);
+	let store = dbStores.get(key);
 	if (!store) {
 		store = new Map();
-		stores.set(key, store);
+		dbStores.set(key, store);
 	}
 	return store;
 }
 
 const keyValueModule: VirtualTableModule<KeyValueTable> = {
 	async create(db: Database, tableSchema: TableSchema): Promise<KeyValueTable> {
-		const store = getOrCreateStore(tableSchema.schemaName, tableSchema.name);
+		const store = getOrCreateStore(db, tableSchema.schemaName, tableSchema.name);
 		const table = new KeyValueTable(db, keyValueModule, tableSchema.schemaName, tableSchema.name, store);
 		table.tableSchema = tableSchema;
 		return table;
 	},
 
 	async connect(db: Database, _pAux: unknown, _moduleName: string, schemaName: string, tableName: string): Promise<KeyValueTable> {
-		const store = getOrCreateStore(schemaName, tableName);
+		const store = getOrCreateStore(db, schemaName, tableName);
 		return new KeyValueTable(db, keyValueModule, schemaName, tableName, store);
 	},
 
-	async destroy(_db: Database, _pAux: unknown, _moduleName: string, schemaName: string, tableName: string): Promise<void> {
-		const key = `${schemaName}.${tableName}`.toLowerCase();
-		stores.delete(key);
+	async destroy(db: Database, _pAux: unknown, _moduleName: string, schemaName: string, tableName: string): Promise<void> {
+		const dbStores = storesByDb.get(db);
+		if (dbStores) {
+			dbStores.delete(`${schemaName}.${tableName}`.toLowerCase());
+		}
 	}
 };
 
 // --- Functions: Math and Data Utilities ---
 
 const DETERMINISTIC_UTF8 = FunctionFlags.UTF8 | FunctionFlags.DETERMINISTIC;
-
-const REAL_SCALAR = {
-	typeClass: 'scalar' as const,
-	logicalType: REAL_TYPE,
-	nullable: true,
-	isReadOnly: true,
-};
-
-const INTEGER_SCALAR = {
-	typeClass: 'scalar' as const,
-	logicalType: INTEGER_TYPE,
-	nullable: true,
-	isReadOnly: true,
-};
-
-const TEXT_SCALAR = {
-	typeClass: 'scalar' as const,
-	logicalType: TEXT_TYPE,
-	nullable: true,
-	isReadOnly: true,
-};
 
 function mathRoundTo(value: SqlValue, precision: SqlValue): SqlValue {
 	if (value === null || value === undefined) return null;
@@ -222,19 +210,19 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 		functions: [
 			{
 				schema: createScalarFunction(
-					{ name: 'math_round_to', numArgs: 2, flags: DETERMINISTIC_UTF8, returnType: REAL_SCALAR },
+					{ name: 'math_round_to', numArgs: 2, flags: DETERMINISTIC_UTF8, returnType: REAL_RETURN },
 					mathRoundTo,
 				),
 			},
 			{
 				schema: createScalarFunction(
-					{ name: 'hex_to_int', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: INTEGER_SCALAR },
+					{ name: 'hex_to_int', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: INTEGER_RETURN },
 					hexToInt,
 				),
 			},
 			{
 				schema: createScalarFunction(
-					{ name: 'int_to_hex', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_SCALAR },
+					{ name: 'int_to_hex', numArgs: 1, flags: DETERMINISTIC_UTF8, returnType: TEXT_RETURN },
 					intToHex,
 				),
 			},
@@ -249,8 +237,8 @@ export default function register(_db: Database, _config: Record<string, SqlValue
 							isReadOnly: true,
 							isSet: false,
 							columns: [
-								{ name: 'property', type: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: false, isReadOnly: true } },
-								{ name: 'value', type: { typeClass: 'scalar' as const, logicalType: TEXT_TYPE, nullable: true, isReadOnly: true } },
+								{ name: 'property', type: scalarReturn(TEXT_TYPE, false) },
+								{ name: 'value', type: scalarReturn(TEXT_TYPE) },
 							],
 							keys: [],
 							rowConstraints: [],

@@ -6,6 +6,7 @@
 import { quereusError } from '../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../common/types.js';
 import type { LogicalType } from '../types/logical-type.js';
+import { validateIndexDescriptor, type IndexDescriptor } from './index-descriptor.js';
 
 /**
  * Constraint operators that can be pushed down to virtual tables
@@ -38,6 +39,40 @@ export interface RangeSpec {
 }
 
 /**
+ * Describes an `IN` constraint whose member values are produced at execution time
+ * (typically from a subquery), so the planner cannot name them. Present ⇒ `value`
+ * is absent.
+ *
+ * A module that accepts such a constraint (`handledFilters[i] = true`, plus
+ * `indexName` and `seekColumnIndexes`) promises only that it can serve the column as
+ * a multi-seek on the named index. In exchange the engine promises that at `query()`
+ * time the module receives an ordinary `plan=5` multi-seek `FilterInfo` — the same
+ * shape a literal `IN (…)` list produces, with `1 ≤ K ≤ maxCount` seek keys — so no
+ * module runtime needs to change and nothing distinguishes a runtime-derived set from
+ * a hand-written list. Declining is always safe. See `docs/module-authoring.md`
+ * § "Runtime-valued `IN` sets".
+ */
+export interface RuntimeSetSpec {
+	/**
+	 * Hard ceiling on the number of seek keys the engine will deliver at query() time.
+	 * The engine enforces it: a larger set never reaches the module — the engine falls
+	 * back to a full scan on its own.
+	 */
+	readonly maxCount: number;
+	/**
+	 * Planner's estimate of the actual count, when it has one. Advisory — a module may
+	 * price against it but must still be correct for any count in `1..maxCount`. When
+	 * present it is an integer in `0..maxCount` (0 meaning "probably empty").
+	 *
+	 * NOTE: no shipped module reads this — both price against `maxCount`, i.e. worst case.
+	 * If the engine ever probes with a large ceiling for a typically tiny set, those plans
+	 * will look more expensive than they are and may lose to a scan they should beat;
+	 * blend `estimatedCount` into the cost (not into the safety gates) at that point.
+	 */
+	readonly estimatedCount?: number;
+}
+
+/**
  * A predicate constraint extracted from WHERE clause
  */
 export interface PredicateConstraint {
@@ -51,6 +86,66 @@ export interface PredicateConstraint {
 	usable: boolean;
 	/** Range specifications for OR_RANGE constraints */
 	ranges?: RangeSpec[];
+	/**
+	 * Set only when `op === 'IN'` and the members are not known at plan time.
+	 * Mutually exclusive with `value` — see {@link RuntimeSetSpec}.
+	 */
+	readonly runtimeSet?: RuntimeSetSpec;
+}
+
+/**
+ * Number of seek keys an equality-role filter contributes at plan time, or null when
+ * the filter cannot fill an equality role at all:
+ *
+ *   `=`                    → 1
+ *   literal `IN`           → `value.length` (elements may be `undefined` for parameter
+ *                            bindings — only the LENGTH is meaningful at plan time)
+ *   runtime-set `IN`       → `runtimeSet.maxCount`, the WORST case; the delivered count
+ *                            is anywhere in `1..maxCount`
+ *   anything else          → null
+ *
+ * A malformed shape — an empty literal list, a `maxCount` that is not a positive integer —
+ * returns null, so a module declines it and it survives as a residual. That mirrors the
+ * literal arm's long-standing non-empty-array gate and holds even when
+ * {@link validateAccessPlanRequest} was never called (the store module, for one, does not
+ * call it), so a bad request degrades to a scan rather than to a zero-key seek.
+ *
+ * For plan-time-known values this mirrors the exact predicate
+ * `rule-select-access-path`'s `eqBySeekCol` uses to pick its per-column equality
+ * constraint, so a module's positional claim and the rule's pick cannot disagree. The
+ * runtime-set arm has no counterpart there because nothing in the planner emits
+ * `runtimeSet` yet — `feat-key-set-semi-join` supplies the engine half and lowers a
+ * runtime set to a literal seek-key list before the rule ever sees it.
+ */
+export function equalitySeekKeyCount(f: PredicateConstraint): number | null {
+	if (f.op === '=') return 1;
+	if (f.op === 'IN') {
+		if (f.runtimeSet) {
+			const { maxCount } = f.runtimeSet;
+			return Number.isInteger(maxCount) && maxCount > 0 ? maxCount : null;
+		}
+		if (Array.isArray(f.value) && (f.value as unknown[]).length > 0) {
+			return (f.value as unknown[]).length;
+		}
+	}
+	return null;
+}
+
+/**
+ * True when the filter may seek more than one key — i.e. it walks the index in seek-key
+ * order rather than column order, so a plan built on it cannot claim `providesOrdering`
+ * over that column and is not a scan-constant.
+ *
+ * A well-formed runtime set is ALWAYS multi-valued here, even at `maxCount === 1`: the
+ * delivered count is not knowable at plan time, and mistaking a multi-seek for a constant
+ * would elide a `Sort` the plan needs. (That is the one case where this disagrees with
+ * `equalitySeekKeyCount(f) > 1`; the conservative answer is the safe one.) A malformed
+ * one fills no equality role at all, so it is not multi-valued either.
+ */
+export function isMultiValueEquality(f: PredicateConstraint): boolean {
+	if (f.op !== 'IN') return false;
+	if (f.runtimeSet) return equalitySeekKeyCount(f) !== null;
+	return Array.isArray(f.value) && (f.value as unknown[]).length > 1;
 }
 
 /**
@@ -77,6 +172,18 @@ export interface BestAccessPlanRequest {
 	requiredOrdering?: readonly OrderingSpec[];
 	/** LIMIT value known at plan time */
 	limit?: number | null;
+	/**
+	 * OFFSET value known at plan time. Modules pushing LIMIT into the scan
+	 * must read this and stamp `scan-side limit = limit + offset`, because the
+	 * runtime LimitOffsetNode still applies the OFFSET skip above whatever the
+	 * scan emits — pushing only `limit` would underproduce by `offset` rows.
+	 *
+	 * If the module advertises `supportsOrdinalSeek` on its result, the runtime
+	 * may instead consume this `offset` directly as a seek-to-kth-row directive
+	 * (no buffer-and-discard); in that case the scan emits exactly `limit` rows
+	 * starting at the `offset`-th monotonic position.
+	 */
+	offset?: number | null;
 	/** Estimated rows hint from planner (may be unknown) */
 	estimatedRows?: number;
 }
@@ -99,12 +206,85 @@ export interface BestAccessPlanResult {
 	orderingIndexName?: string;
 	/** Name of the index chosen for filtering (e.g., '_primary_' or a secondary index name) */
 	indexName?: string;
+	/**
+	 * Structured identity of the index named by `indexName` (or, for an ordering-only
+	 * plan, by `orderingIndexName`).
+	 *
+	 * OPTIONAL when that name is `_primary_` or matches an index present in the table
+	 * schema — the engine resolves those itself. REQUIRED when the module names the
+	 * index anything else (e.g. a per-plan alias like `_primary_1`): without it the
+	 * engine cannot tell a primary-key walk from a secondary-index walk, and consumers
+	 * that depend on scan order (the isolation layer's overlay merge) cannot trust the
+	 * plan. See `docs/module-authoring.md`.
+	 */
+	indexDescriptor?: IndexDescriptor;
 	/** Column indexes that form the seek/range key, in order */
 	seekColumnIndexes?: readonly number[];
 	/** Whether this plan guarantees unique rows (helps DISTINCT optimization) */
 	isSet?: boolean;
 	/** Free-text explanation for debugging */
 	explains?: string;
+
+	/**
+	 * The access path emits rows in monotonic non-decreasing (or non-increasing,
+	 * for `direction: 'desc'`) order on the named column. Stronger than
+	 * `providesOrdering` because:
+	 *   - it is a property of the underlying storage (not just a sort),
+	 *   - the column's values are total-ordered with no gaps in coverage,
+	 *   - downstream rules may rely on `between(a,b)` semantics.
+	 *
+	 * `strict = true` additionally guarantees no two rows share a value.
+	 *
+	 * `columnIndex` is the table-relative column index (0-based, into
+	 * `request.columns`). The optimizer translates this into an attribute id
+	 * when lifting onto the physical leaf node.
+	 */
+	monotonicOn?: {
+		columnIndex: number;
+		direction: 'asc' | 'desc';
+		strict: boolean;
+	};
+
+	/**
+	 * The module honours each index column's declared COLLATION when filtering and
+	 * positioning a NON-equality (range / BETWEEN / prefix-range / OR_RANGE) index
+	 * seek — i.e. it compares range bounds and early-terminates the walk under the
+	 * index collation, not a fixed BINARY comparator.
+	 *
+	 * Default/absent ⇒ the access-path collation-cover analysis
+	 * (`classifyConstraintCover` in `rule-select-access-path.ts`) conservatively
+	 * DECLINES a non-BINARY range seek (predicate collation = index collation but not
+	 * BINARY) and falls back to a scan + residual, because a BINARY bound filter over
+	 * a non-BINARY-ordered window would under-fetch case/space variants.
+	 *
+	 * When true, that range seek is permitted whenever the predicate's effective
+	 * collation equals the index collation (mirroring the equality MATCH arm). Only
+	 * modules whose runtime actually threads the index collation into the bound
+	 * compare may set this — the in-memory vtab does (`scan-layer.ts` /
+	 * `plan-filter.ts`), and so does the store module (its post-fetch row filter
+	 * `StoreTable.compareValues` compares every pushed bound under the column's
+	 * declared collation via `compareSqlValues`).
+	 */
+	honorsCollatedRangeBounds?: boolean;
+
+	/**
+	 * The access path supports O(log N) seek to the kth row in monotonic
+	 * order — i.e., LIMIT n OFFSET k can be pushed into the scan instead
+	 * of buffer-and-discard. Implies `monotonicOn` is set.
+	 *
+	 * The vtab's query()/scan() implementation must accept an offset
+	 * directive in its access-plan request when this is advertised.
+	 */
+	supportsOrdinalSeek?: boolean;
+
+	/**
+	 * The access path can serve as the right input to a streaming asof
+	 * scan: given a left row and its match key, the vtab can position
+	 * its cursor at the largest row ≤ that key in O(log avg-gap), and
+	 * advance forward without re-seeking for monotonically increasing
+	 * left keys. Implies `monotonicOn` is set.
+	 */
+	supportsAsofRight?: boolean;
 }
 
 /**
@@ -201,6 +381,15 @@ export class AccessPlanBuilder {
 	}
 
 	/**
+	 * Set the structured identity of the chosen index. Required when `indexName` is a
+	 * per-plan alias the engine cannot resolve from the table schema.
+	 */
+	setIndexDescriptor(indexDescriptor: IndexDescriptor): this {
+		this.result.indexDescriptor = indexDescriptor;
+		return this;
+	}
+
+	/**
 	 * Set the column indexes that form the seek/range key
 	 */
 	setSeekColumns(seekColumnIndexes: readonly number[]): this {
@@ -233,6 +422,49 @@ export class AccessPlanBuilder {
 }
 
 /**
+ * Validate the REQUEST the engine hands a module, before the module can improvise on a
+ * shape it was never promised. Called from {@link validateAccessPlan}, so every module
+ * that follows the validate-your-plan convention gets it without a second call site.
+ *
+ * The checks are all on {@link RuntimeSetSpec}: it must ride an `IN`, it must not carry
+ * plan-time `value`s (a module reading `value` on a runtime set would seek on garbage),
+ * its ceiling must be a usable count, and an advisory `estimatedCount` must fall within
+ * that ceiling — an estimate above `maxCount` describes a set the engine has promised
+ * never to deliver, so it is an engine bug rather than a pessimistic guess.
+ */
+export function validateAccessPlanRequest(request: BestAccessPlanRequest): void {
+	for (const filter of request.filters) {
+		if (!filter.runtimeSet) continue;
+
+		if (filter.op !== 'IN') {
+			quereusError(
+				`runtimeSet is only valid on an 'IN' constraint, got '${filter.op}' on column ${filter.columnIndex}`,
+				StatusCode.FORMAT
+			);
+		}
+		if (filter.value !== undefined) {
+			quereusError(
+				`runtimeSet and value are mutually exclusive (column ${filter.columnIndex}); a runtime set has no plan-time members`,
+				StatusCode.FORMAT
+			);
+		}
+		const { maxCount, estimatedCount } = filter.runtimeSet;
+		if (!Number.isInteger(maxCount) || maxCount < 1) {
+			quereusError(
+				`runtimeSet.maxCount must be an integer >= 1, got ${maxCount} on column ${filter.columnIndex}`,
+				StatusCode.FORMAT
+			);
+		}
+		if (estimatedCount !== undefined && (!Number.isInteger(estimatedCount) || estimatedCount < 0 || estimatedCount > maxCount)) {
+			quereusError(
+				`runtimeSet.estimatedCount must be an integer in 0..${maxCount}, got ${estimatedCount} on column ${filter.columnIndex}`,
+				StatusCode.FORMAT
+			);
+		}
+	}
+}
+
+/**
  * Validation function for access plan results
  * Throws if the plan violates basic contracts
  */
@@ -240,6 +472,8 @@ export function validateAccessPlan(
 	request: BestAccessPlanRequest,
 	result: BestAccessPlanResult
 ): void {
+	validateAccessPlanRequest(request);
+
 	// Validate handledFilters array length
 	if (result.handledFilters.length !== request.filters.length) {
 		quereusError(
@@ -270,6 +504,27 @@ export function validateAccessPlan(
 		}
 	}
 
+	// Whenever a plan claims `providesOrdering`, it must identify the index that
+	// produces that order via `orderingIndexName`. When the same plan also drives
+	// iteration via `indexName` (i.e., a seek/range plan), the two MUST refer to
+	// the same index — claiming ordering from one index while iterating via
+	// another silently emits rows in the wrong order. This invariant catches
+	// the bug at the boundary regardless of which module emits the plan.
+	if (result.providesOrdering && result.providesOrdering.length > 0) {
+		if (!result.orderingIndexName) {
+			quereusError(
+				'providesOrdering requires orderingIndexName to identify the source index',
+				StatusCode.FORMAT
+			);
+		}
+		if (result.indexName && result.indexName !== result.orderingIndexName) {
+			quereusError(
+				`providesOrdering claims ordering from '${result.orderingIndexName}' but plan iterates via '${result.indexName}'; ordering can only be claimed from the same index that drives iteration`,
+				StatusCode.FORMAT
+			);
+		}
+	}
+
 	// Validate seek column indexes
 	if (result.seekColumnIndexes) {
 		for (const colIdx of result.seekColumnIndexes) {
@@ -280,6 +535,45 @@ export function validateAccessPlan(
 				);
 			}
 		}
+	}
+
+	// A supplied indexDescriptor must describe the index the plan actually drives —
+	// a descriptor naming a different index than `indexName` is a module bug, and
+	// silently reconciling it would hand order-sensitive consumers the wrong sort key.
+	if (result.indexDescriptor) {
+		validateIndexDescriptor(
+			result.indexDescriptor,
+			result.indexName,
+			result.orderingIndexName,
+			request.columns.length,
+		);
+	}
+
+	// Validate monotonicOn column index is in range
+	if (result.monotonicOn) {
+		const colIdx = result.monotonicOn.columnIndex;
+		if (colIdx < 0 || colIdx >= request.columns.length) {
+			quereusError(
+				`Invalid monotonicOn column index ${colIdx}, must be 0-${request.columns.length - 1}`,
+				StatusCode.FORMAT
+			);
+		}
+	}
+
+	// Validate supportsOrdinalSeek implies monotonicOn is set
+	if (result.supportsOrdinalSeek && !result.monotonicOn) {
+		quereusError(
+			'supportsOrdinalSeek requires monotonicOn to be set',
+			StatusCode.FORMAT
+		);
+	}
+
+	// Validate supportsAsofRight implies monotonicOn is set
+	if (result.supportsAsofRight && !result.monotonicOn) {
+		quereusError(
+			'supportsAsofRight requires monotonicOn to be set',
+			StatusCode.FORMAT
+		);
 	}
 }
 

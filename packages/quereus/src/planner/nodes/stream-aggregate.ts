@@ -7,13 +7,18 @@ import { formatExpressionList } from '../../util/plan-formatter.js';
 import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { ColumnReferenceNode } from './reference.js';
+import { propagateAggregateFds } from './aggregate-node.js';
+import { aggregateRowsFrom, physicalSourceRows } from '../util/row-estimates.js';
+import { disambiguateColumnNames } from '../util/output-names.js';
+import type { AggregationCapable } from '../framework/characteristics.js';
 
 /**
  * Physical node representing a streaming aggregate operation.
  * Requires input to be ordered by grouping columns.
  */
-export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode {
+export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode, AggregationCapable {
   override readonly nodeType = PlanNodeType.StreamAggregate;
+  readonly isAggregationCapable = true as const;
 
   private attributesCache: Cached<Attribute[]>;
 
@@ -25,19 +30,20 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
     estimatedCostOverride?: number,
     public readonly preserveAttributeIds?: readonly Attribute[]
   ) {
-    // Streaming aggregation is cheaper than hash aggregation
-    // Cost is linear in the number of input rows
+    // Self-cost only: the source (and group-by/aggregate exprs) flow in via
+    // getChildren(). Self is the streaming pass — linear in input rows, cheaper
+    // than hash aggregation.
     const sourceRows = source.estimatedRows ?? 1000;
     const streamingCost = sourceRows * 0.1; // Lower cost multiplier for streaming
 
-    super(scope, estimatedCostOverride ?? (source.getTotalCost() + streamingCost));
+    super(scope, estimatedCostOverride ?? streamingCost);
 
     this.attributesCache = new Cached(() => this.buildAttributes());
   }
 
   private buildAttributes(): Attribute[] {
-    // If we have preserved attribute IDs, use them directly
-    // The optimizer rule now passes both aggregate AND source attributes
+    // If we have preserved attribute IDs, use them directly. The optimizer rule
+    // passes exactly the logical AggregateNode's GROUP BY + aggregate attributes.
     if (this.preserveAttributeIds) {
       return this.preserveAttributeIds.slice();
     }
@@ -66,18 +72,9 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
       });
     });
 
-    // Add source attributes to support HAVING clauses
-    const sourceAttributes = this.source.getAttributes();
-    const existingAttrNames = new Set(attributes.map(attr => attr.name));
-
-    for (const sourceAttr of sourceAttributes) {
-      // Only add if not already present by name (avoid duplicates for GROUP BY columns)
-      if (!existingAttrNames.has(sourceAttr.name)) {
-        attributes.push(sourceAttr);
-        existingAttrNames.add(sourceAttr.name);
-      }
-    }
-
+    // Advertise only GROUP BY + aggregate columns — exactly what the emitter yields.
+    // Source values for HAVING / correlated reads flow through the runtime row-descriptor
+    // context, not through extra output attributes.
     return attributes;
   }
 
@@ -95,41 +92,40 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
   getType(): RelationType {
     const columns = [];
 
-    // Start with preserved attributes if we have them, otherwise build GROUP BY + aggregates
+    // Start with preserved attributes if we have them, otherwise build GROUP BY + aggregates.
+    // Duplicate output names are numbered (`a`, `a:1`) exactly as the logical
+    // AggregateNode does — `GROUP BY l.a, r.a` publishes two `a` columns, and a
+    // result-row object keyed by name would drop one of them.
     if (this.preserveAttributeIds) {
       // Use preserved attributes to match getAttributes() exactly
-      for (const attr of this.preserveAttributeIds) {
+      const names = disambiguateColumnNames(this.preserveAttributeIds.map(attr => attr.name));
+      this.preserveAttributeIds.forEach((attr, index) => {
         columns.push({
-          name: attr.name,
+          name: names[index],
           type: attr.type,
           generated: false  // Source attributes are not generated
         });
-      }
+      });
     } else {
+      const names = disambiguateColumnNames([
+        ...this.groupBy.map((expr, index) => this.getGroupByColumnName(expr, index)),
+        ...this.aggregates.map(agg => agg.alias)
+      ]);
+
       // Group by columns come first
       columns.push(...this.groupBy.map((expr, index) => ({
-        name: this.getGroupByColumnName(expr, index),
+        name: names[index],
         type: expr.getType(),
         generated: false
       })));
 
-      // Then aggregate columns
-      columns.push(...this.aggregates.map(agg => ({
-        name: agg.alias,
+      // Then aggregate columns. Only GROUP BY + aggregate columns are advertised
+      // (consistent with getAttributes()); source columns are not emitted as output.
+      columns.push(...this.aggregates.map((agg, index) => ({
+        name: names[this.groupBy.length + index],
         type: agg.expression.getType(),
         generated: true
       })));
-
-      // Add all source columns to support HAVING clauses (consistent with getAttributes())
-      const sourceType = this.source.getType();
-      const existingNames = new Set(columns.map(col => col.name));
-
-      for (const sourceCol of sourceType.columns) {
-        // Only add if not already present (avoid duplicates for GROUP BY columns)
-        if (!existingNames.has(sourceCol.name)) {
-          columns.push(sourceCol);
-        }
-      }
     }
 
     return {
@@ -181,30 +177,34 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
   }
 
   get estimatedRows(): number | undefined {
-    const sourceRows = this.source.estimatedRows;
-    if (sourceRows === undefined) return undefined;
-
-    if (this.groupBy.length > 0) {
-      // For streaming aggregate, we assume groups are somewhat clustered
-      // so we estimate fewer groups than hash aggregate would
-      return Math.max(1, Math.floor(sourceRows / 10));
-    } else {
-      // No GROUP BY means single output row
-      return 1;
-    }
+    return this.rowsFrom(this.source.estimatedRows);
   }
 
-  computePhysical(_childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+  private rowsFrom(sourceRows: number | undefined): number | undefined {
+    return aggregateRowsFrom(sourceRows, this.groupBy.length > 0, 10);
+  }
+
+  computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+    const sourcePhysical = childrenPhysical[0];
+    const { fds, equivClasses, constantBindings, domainConstraints } = propagateAggregateFds(
+      this.source.getAttributeIndex(),
+      this.groupBy,
+      sourcePhysical,
+      this.getAttributes().length,
+    );
+
     return {
-      estimatedRows: this.estimatedRows,
+      estimatedRows: this.rowsFrom(physicalSourceRows(sourcePhysical, this.source)),
       // Stream aggregate preserves ordering on GROUP BY columns
       ordering: this.groupBy.length > 0 ?
         this.groupBy.map((_, idx) => ({ column: idx, desc: false })) :
         undefined,
-      // Aggregation creates unique keys on GROUP BY columns
-      uniqueKeys: this.groupBy.length > 0 ?
-        [this.groupBy.map((_, idx) => idx)] :
-        [[]], // Single row if no GROUP BY
+      // Aggregation boundary: drop monotonicOn (the grouped relation is a set).
+      monotonicOn: undefined,
+      fds,
+      equivClasses,
+      constantBindings,
+      domainConstraints,
     };
   }
 
@@ -242,9 +242,6 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
       }));
     }
 
-    // Expose logical unique keys: group-by columns (0..groupCount-1) or [[]] for global aggregate
-    const groupCount = this.groupBy.length;
-    props.uniqueKeys = groupCount > 0 ? [Array.from({ length: groupCount }, (_, i) => i)] : [[]];
     return props;
   }
 
@@ -287,5 +284,37 @@ export class StreamAggregateNode extends PlanNode implements UnaryRelationalNode
       undefined, // Let it recalculate cost
       this.preserveAttributeIds // Preserve the original attribute IDs
     );
+  }
+
+  // AggregationCapable interface. These members mirror the logical AggregateNode's
+  // so `CapabilityDetectors.isAggregating` recognizes the physical form too. The
+  // physical-selection rule (`ruleAggregatePhysical`) is nodeType-gated to the logical
+  // Aggregate and never re-runs on this node; these exist to honor the brand contract
+  // and to keep the defensive aggregate-root descent in `rule-fanout-lookup-join`
+  // correct should a physical aggregate ever surface at a subquery root.
+  getGroupingKeys(): readonly ScalarPlanNode[] {
+    return this.groupBy;
+  }
+
+  getAggregateExpressions(): readonly { expr: ScalarPlanNode; alias: string; attributeId: number }[] {
+    const attributes = this.getAttributes();
+    const groupByCount = this.groupBy.length;
+    return this.aggregates.map((agg, index) => ({
+      expr: agg.expression,
+      alias: agg.alias,
+      attributeId: attributes[groupByCount + index].id
+    }));
+  }
+
+  requiresOrdering(): boolean {
+    return true; // streaming aggregation consumes input ordered on the group keys
+  }
+
+  canStreamAggregate(): boolean {
+    return true;
+  }
+
+  getSource(): RelationalPlanNode {
+    return this.source;
   }
 }

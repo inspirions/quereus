@@ -1,5 +1,6 @@
 import type { ReturningNode } from '../../planner/nodes/returning-node.js';
-import type { Instruction, RuntimeContext, InstructionRun } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import type { Row, OutputValue } from '../../common/types.js';
 import type { EmissionContext } from '../emission-context.js';
 import { emitPlanNode, emitCallFromPlan } from '../emitters.js';
@@ -25,10 +26,19 @@ export function emitReturning(plan: ReturningNode, ctx: EmissionContext): Instru
 		try {
 			for await (const sourceRow of executorRows) {
 				slot.set(sourceRow);
-				// Evaluate projection expressions in the context of this row
-				const outputs = projectionCallbacks.map(func => func(rctx));
-				const resolved = await Promise.all(outputs);
-				yield resolved as Row;
+				// Sequential evaluation: parallel callbacks that share a plan
+				// subtree (e.g. two scalar subqueries against the same CTE)
+				// would race on the shared inner-scan RowSlot. See ticket
+				// serialize-project-subquery-evaluation for the canonical fix.
+				const outputs: OutputValue[] = [];
+				for (const func of projectionCallbacks) {
+					// Resolve each column without a per-column microtask hop: `await`
+					// only when the sub-program is genuinely a promise (rare). See
+					// resolveMaybe in runtime/async-util.ts for the rationale.
+					const value = func(rctx);
+					outputs.push(value instanceof Promise ? await value : value);
+				}
+				yield outputs as Row;
 			}
 		} finally {
 			slot.close();
@@ -40,7 +50,7 @@ export function emitReturning(plan: ReturningNode, ctx: EmissionContext): Instru
 
 	return {
 		params: [executorInstruction, ...projectionEvaluators],
-		run: run as InstructionRun,
+		run: asRun(run),
 		note: `returning(${plan.projections.length} cols)`
 	};
 }

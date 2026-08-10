@@ -1,6 +1,7 @@
-import type { Instruction, InstructionRun, RuntimeContext } from '../types.js';
+import type { Instruction, RuntimeContext } from '../types.js';
+import { asRun } from '../types.js';
 import { emitPlanNode, createValidatedInstruction } from '../emitters.js';
-import { QuereusError } from '../../common/errors.js';
+import { AbortError, QuereusError } from '../../common/errors.js';
 import { StatusCode, type SqlValue, type Row } from '../../common/types.js';
 import type { FunctionSchema, IntegratedTableValuedFunc, TableValuedFunc } from '../../schema/function.js';
 import { isTableValuedFunctionSchema } from '../../schema/function.js';
@@ -15,6 +16,20 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 
 	// Create row descriptor for function output attributes
 	const rowDescriptor = buildRowDescriptor(plan.getAttributes());
+	const declaredColumnCount = plan.getAttributes().length;
+
+	// Normalize yielded rows to the declared column count: pad short rows with null,
+	// truncate over-wide rows. Keeps positional access (ArrayIndex) consistent with
+	// the declared schema regardless of what the TVF implementation actually yields.
+	// A TVF that declares no columns (e.g. `split_string`, registered without a
+	// `returnType`) opts out entirely — it has no positional slots to align, so
+	// truncating to zero width would silently drop the row payload.
+	const normalizeRow = (row: Row): Row => {
+		if (declaredColumnCount === 0 || row.length === declaredColumnCount) return row;
+		return row.length < declaredColumnCount
+			? [...row, ...new Array(declaredColumnCount - row.length).fill(null)]
+			: row.slice(0, declaredColumnCount);
+	};
 
 	// Look up the function during emission and record the dependency
 	// First try exact argument count, then try variable argument function
@@ -23,7 +38,7 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 		functionSchema = ctx.findFunction(functionName, -1); // Try variable argument function
 	}
 	if (!functionSchema) {
-		throw new QuereusError(`Unknown function: ${functionName}/${numArgs}`, StatusCode.ERROR);
+		throw new QuereusError(`Function not found: ${functionName}/${numArgs}`, StatusCode.ERROR);
 	}
 	if (!isTableValuedFunctionSchema(functionSchema)) {
 		throw new QuereusError(`Function ${functionName}/${numArgs} is not a table-valued function`, StatusCode.ERROR);
@@ -53,14 +68,18 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 			const slot = createRowSlot(innerCtx, rowDescriptor);
 			try {
 				for await (const row of iterable) {
-					slot.set(row);
-					yield row;
+					const normalized = normalizeRow(row);
+					slot.set(normalized);
+					yield normalized;
 				}
 			} finally {
 				slot.close();
 			}
-		} catch (error: any) {
-			throw new QuereusError(`Table-valued function ${functionName} failed: ${error.message}`, StatusCode.ERROR, error);
+		} catch (error: unknown) {
+			// Preserve cancellation identity — don't re-wrap an abort as a generic TVF error.
+			if (error instanceof AbortError) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			throw new QuereusError(`Table-valued function ${functionName} failed: ${message}`, StatusCode.ERROR, error instanceof Error ? error : undefined);
 		}
 	}
 
@@ -80,7 +99,7 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 			// Special validation for known variable argument functions
 			if (functionName === 'json_each' || functionName === 'json_tree') {
 				if (args.length < 1 || args.length > 2) {
-					throw new QuereusError(`${functionName} requires 1 or 2 arguments (jsonSource, [rootPath])`, StatusCode.ERROR);
+					throw new QuereusError(`Error: ${functionName} requires 1 or 2 arguments (jsonSource, [rootPath])`, StatusCode.ERROR);
 				}
 			}
 		}
@@ -95,14 +114,18 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 			const slot = createRowSlot(innerCtx, rowDescriptor);
 			try {
 				for await (const row of iterable) {
-					slot.set(row);
-					yield row;
+					const normalized = normalizeRow(row);
+					slot.set(normalized);
+					yield normalized;
 				}
 			} finally {
 				slot.close();
 			}
-		} catch (error: any) {
-			throw new QuereusError(`Table-valued function ${functionName} failed: ${error.message}`, StatusCode.ERROR, error);
+		} catch (error: unknown) {
+			// Preserve cancellation identity — don't re-wrap an abort as a generic TVF error.
+			if (error instanceof AbortError) throw error;
+			const message = error instanceof Error ? error.message : String(error);
+			throw new QuereusError(`Table-valued function ${functionName} failed: ${message}`, StatusCode.ERROR, error instanceof Error ? error : undefined);
 		}
 	}
 
@@ -111,7 +134,7 @@ export function emitTableValuedFunctionCall(plan: TableFunctionCallNode, ctx: Em
 
 	return createValidatedInstruction(
 		[...operandExprs],
-		runFunction as InstructionRun,
+		asRun(runFunction),
 		ctx,
 		`TVF:${plan.functionName}(${plan.operands.length})`
 	);

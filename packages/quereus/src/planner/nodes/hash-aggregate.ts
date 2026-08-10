@@ -8,6 +8,10 @@ import { quereusError } from '../../common/errors.js';
 import { StatusCode } from '../../common/types.js';
 import type { ColumnReferenceNode } from './reference.js';
 import { COST_CONSTANTS } from '../cost/index.js';
+import { propagateAggregateFds } from './aggregate-node.js';
+import { aggregateRowsFrom, physicalSourceRows } from '../util/row-estimates.js';
+import { disambiguateColumnNames } from '../util/output-names.js';
+import type { AggregationCapable } from '../framework/characteristics.js';
 
 /**
  * Physical node representing a hash-based aggregate operation.
@@ -15,8 +19,9 @@ import { COST_CONSTANTS } from '../cost/index.js';
  * Builds a hash map keyed by GROUP BY columns, accumulates aggregate state per group,
  * and emits all groups at the end.
  */
-export class HashAggregateNode extends PlanNode implements UnaryRelationalNode {
+export class HashAggregateNode extends PlanNode implements UnaryRelationalNode, AggregationCapable {
 	override readonly nodeType = PlanNodeType.HashAggregate;
+	readonly isAggregationCapable = true as const;
 
 	private attributesCache: Cached<Attribute[]>;
 
@@ -33,7 +38,9 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode {
 		const hashCost = sourceRows * COST_CONSTANTS.HASH_AGG_BUILD_PER_ROW
 			+ estimatedGroups * COST_CONSTANTS.HASH_AGG_PER_GROUP;
 
-		super(scope, estimatedCostOverride ?? (source.getTotalCost() + hashCost));
+		// Self-cost only: the source (and group-by/aggregate exprs) flow in via
+		// getChildren(). Self is the hash build + per-group finalization cost.
+		super(scope, estimatedCostOverride ?? hashCost);
 
 		this.attributesCache = new Cached(() => this.buildAttributes());
 	}
@@ -64,16 +71,9 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode {
 			});
 		});
 
-		const sourceAttributes = this.source.getAttributes();
-		const existingAttrNames = new Set(attributes.map(attr => attr.name));
-
-		for (const sourceAttr of sourceAttributes) {
-			if (!existingAttrNames.has(sourceAttr.name)) {
-				attributes.push(sourceAttr);
-				existingAttrNames.add(sourceAttr.name);
-			}
-		}
-
+		// Advertise only GROUP BY + aggregate columns — exactly what the emitter yields.
+		// Source values for HAVING / correlated reads flow through the runtime row-descriptor
+		// context, not through extra output attributes.
 		return attributes;
 	}
 
@@ -88,35 +88,37 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode {
 	getType(): RelationType {
 		const columns = [];
 
+		// Duplicate output names are numbered (`a`, `a:1`) exactly as the logical
+		// AggregateNode does — `GROUP BY l.a, r.a` publishes two `a` columns, and a
+		// result-row object keyed by name would drop one of them.
 		if (this.preserveAttributeIds) {
-			for (const attr of this.preserveAttributeIds) {
+			const names = disambiguateColumnNames(this.preserveAttributeIds.map(attr => attr.name));
+			this.preserveAttributeIds.forEach((attr, index) => {
 				columns.push({
-					name: attr.name,
+					name: names[index],
 					type: attr.type,
 					generated: false
 				});
-			}
+			});
 		} else {
+			const names = disambiguateColumnNames([
+				...this.groupBy.map((expr, index) => this.getGroupByColumnName(expr, index)),
+				...this.aggregates.map(agg => agg.alias)
+			]);
+
 			columns.push(...this.groupBy.map((expr, index) => ({
-				name: this.getGroupByColumnName(expr, index),
+				name: names[index],
 				type: expr.getType(),
 				generated: false
 			})));
 
-			columns.push(...this.aggregates.map(agg => ({
-				name: agg.alias,
+			// Only GROUP BY + aggregate columns are advertised (consistent with
+			// getAttributes()); source columns are not emitted as output.
+			columns.push(...this.aggregates.map((agg, index) => ({
+				name: names[this.groupBy.length + index],
 				type: agg.expression.getType(),
 				generated: true
 			})));
-
-			const sourceType = this.source.getType();
-			const existingNames = new Set(columns.map(col => col.name));
-
-			for (const sourceCol of sourceType.columns) {
-				if (!existingNames.has(sourceCol.name)) {
-					columns.push(sourceCol);
-				}
-			}
 		}
 
 		return {
@@ -165,24 +167,32 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode {
 	}
 
 	get estimatedRows(): number | undefined {
-		const sourceRows = this.source.estimatedRows;
-		if (sourceRows === undefined) return undefined;
-
-		if (this.groupBy.length > 0) {
-			return Math.max(1, Math.floor(sourceRows / 10));
-		} else {
-			return 1;
-		}
+		return this.rowsFrom(this.source.estimatedRows);
 	}
 
-	computePhysical(_childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+	private rowsFrom(sourceRows: number | undefined): number | undefined {
+		return aggregateRowsFrom(sourceRows, this.groupBy.length > 0, 10);
+	}
+
+	computePhysical(childrenPhysical: PhysicalProperties[]): Partial<PhysicalProperties> {
+		const sourcePhysical = childrenPhysical[0];
+		const { fds, equivClasses, constantBindings, domainConstraints } = propagateAggregateFds(
+			this.source.getAttributeIndex(),
+			this.groupBy,
+			sourcePhysical,
+			this.getAttributes().length,
+		);
+
 		return {
-			estimatedRows: this.estimatedRows,
+			estimatedRows: this.rowsFrom(physicalSourceRows(sourcePhysical, this.source)),
 			// Hash aggregate does NOT preserve input ordering
 			ordering: undefined,
-			uniqueKeys: this.groupBy.length > 0 ?
-				[this.groupBy.map((_, idx) => idx)] :
-				[[]],
+			// Aggregation boundary: drop monotonicOn (the grouped relation is a set).
+			monotonicOn: undefined,
+			fds,
+			equivClasses,
+			constantBindings,
+			domainConstraints,
 		};
 	}
 
@@ -220,8 +230,6 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode {
 			}));
 		}
 
-		const groupCount = this.groupBy.length;
-		props.uniqueKeys = groupCount > 0 ? [Array.from({ length: groupCount }, (_, i) => i)] : [[]];
 		return props;
 	}
 
@@ -260,5 +268,34 @@ export class HashAggregateNode extends PlanNode implements UnaryRelationalNode {
 			undefined,
 			this.preserveAttributeIds
 		);
+	}
+
+	// AggregationCapable interface. See StreamAggregateNode for why the physical
+	// aggregate carries these (brand contract + defensive fanout descent); the
+	// physical-selection rule never re-runs on this node.
+	getGroupingKeys(): readonly ScalarPlanNode[] {
+		return this.groupBy;
+	}
+
+	getAggregateExpressions(): readonly { expr: ScalarPlanNode; alias: string; attributeId: number }[] {
+		const attributes = this.getAttributes();
+		const groupByCount = this.groupBy.length;
+		return this.aggregates.map((agg, index) => ({
+			expr: agg.expression,
+			alias: agg.alias,
+			attributeId: attributes[groupByCount + index].id
+		}));
+	}
+
+	requiresOrdering(): boolean {
+		return false; // hash aggregation does not require ordered input
+	}
+
+	canStreamAggregate(): boolean {
+		return false; // this IS the hash strategy — not a streaming aggregate
+	}
+
+	getSource(): RelationalPlanNode {
+		return this.source;
 	}
 }

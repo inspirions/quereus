@@ -24,6 +24,15 @@ while (i < args.length) {
 		case '--store':
 			env.QUEREUS_TEST_STORE = 'true';
 			break;
+		case '--fork-strict':
+			env.QUEREUS_FORK_STRICT = '1';
+			break;
+		case '--context-strict':
+			env.QUEREUS_CONTEXT_STRICT = '1';
+			break;
+		case '--repr-strict':
+			env.QUEREUS_REPR_STRICT = '1';
+			break;
 		case '--show-plan':
 			env.QUEREUS_TEST_SHOW_PLAN = 'true';
 			break;
@@ -72,13 +81,22 @@ while (i < args.length) {
 // Set up paths
 const projectRoot = join(__dirname, '../..');
 const registerPath = join(__dirname, 'register.mjs');
-const mochaPath = join(projectRoot, 'node_modules', 'mocha', 'bin', 'mocha.js');
+
+// Resolve mocha path using Yarn PnP
+const mochaPath = fileURLToPath(await import.meta.resolve('mocha/bin/mocha.js'));
 const testPattern = join('packages', 'quereus', 'test', '**', '*.spec.ts');
 
 // Use 'min' reporter by default for concise output (full failure details preserved).
 // Override with --reporter <name> on the command line.
 const hasReporterFlag = testArgs.some((a, i) => a === '--reporter' || a === '-R');
 const reporterArgs = hasReporterFlag ? [] : ['--reporter', 'min'];
+
+// Default to a generous per-test timeout: the property-based suites (fast-check)
+// nominally run in well under 1s but can be starved past Mocha's 2s default when
+// the machine is under concurrent load (e.g. a background ticket runner). 10s
+// keeps real hangs detectable while absorbing contention. Overridable via --timeout.
+const hasTimeoutFlag = testArgs.some((a) => a === '--timeout' || a === '-t');
+const timeoutArgs = hasTimeoutFlag ? [] : ['--timeout', '10000'];
 
 // Build command arguments
 const cmdArgs = [
@@ -87,6 +105,7 @@ const cmdArgs = [
 	testPattern,
 	'--colors',
 	'--bail',
+	...timeoutArgs,
 	...reporterArgs,
 	...testArgs
 ];

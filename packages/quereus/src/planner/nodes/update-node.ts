@@ -4,7 +4,6 @@ import { PlanNode, type RelationalPlanNode, type Attribute, type RowDescriptor, 
 import { PlanNodeType } from './plan-node-type.js';
 import type { TableReferenceNode } from './reference.js';
 import type { ScalarPlanNode } from './plan-node.js';
-import type { ConflictResolution } from '../../common/constants.js';
 import type { RelationType } from '../../common/datatype.js';
 import { formatExpression } from '../../util/plan-formatter.js';
 import { buildAttributesFromFlatDescriptor } from '../../util/row-descriptor.js';
@@ -27,12 +26,20 @@ export class UpdateNode extends PlanNode implements RelationalPlanNode {
     scope: Scope,
     public readonly table: TableReferenceNode,
     public readonly assignments: ReadonlyArray<UpdateAssignment>,
-    		public readonly source: RelationalPlanNode, // Typically a FilterNode wrapping a TableReferenceNode
-		public readonly onConflict: ConflictResolution | undefined,
+    public readonly source: RelationalPlanNode, // Typically a FilterNode wrapping a TableReferenceNode
     public readonly oldRowDescriptor: RowDescriptor, // For constraint checking
     public readonly newRowDescriptor: RowDescriptor, // For constraint checking
     public readonly flatRowDescriptor: RowDescriptor, // For flat OLD/NEW row attributes
-    public readonly mutationContextValues?: Map<string, ScalarPlanNode>, // Mutation context value expressions
+    /**
+     * Mutation context value expressions.
+     *
+     * NOTE: deliberately NOT exposed via `getChildren` (OPT-009): no emitter or rule reads
+     * this map from this node — only `DmlExecutorNode` / `ConstraintCheckNode` consume it,
+     * and they expose their copies. It is therefore a pass-through reference that goes
+     * stale (holds pre-rewrite subtrees) once the optimizer rebuilds those nodes. If
+     * anything ever starts reading it here, expose it as a child first.
+     */
+    public readonly mutationContextValues?: Map<string, ScalarPlanNode>,
     public readonly contextAttributes?: Attribute[], // Mutation context attributes
     public readonly contextDescriptor?: RowDescriptor, // Mutation context row descriptor
   ) {
@@ -98,7 +105,6 @@ export class UpdateNode extends PlanNode implements RelationalPlanNode {
       this.table,
       newAssignments,
       newSource,
-      this.onConflict,
       this.oldRowDescriptor,
       this.newRowDescriptor,
       this.flatRowDescriptor,
@@ -123,7 +129,7 @@ export class UpdateNode extends PlanNode implements RelationalPlanNode {
   }
 
   override getLogicalAttributes(): Record<string, unknown> {
-    const props: Record<string, unknown> = {
+    return {
       table: this.table.tableSchema.name,
       schema: this.table.tableSchema.schemaName,
       assignments: this.assignments.map(assign => ({
@@ -131,11 +137,5 @@ export class UpdateNode extends PlanNode implements RelationalPlanNode {
         value: formatExpression(assign.value)
       }))
     };
-
-    if (this.onConflict) {
-      props.onConflict = this.onConflict;
-    }
-
-    return props;
   }
 }

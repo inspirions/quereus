@@ -1,0 +1,232 @@
+-- adapted from SQLite test/returning1.test
+-- RETURNING extras beyond 42-returning.sqllogic basics:
+-- subqueries in RETURNING expressions, INSERT...SELECT with RETURNING,
+-- generated columns, quoted identifiers, RETURNING on no-op upsert.
+
+-- ===================================
+-- 1. RETURNING with scalar subquery in expression list
+-- ===================================
+
+create table tally (id integer primary key, val integer);
+insert into tally values (1, 100), (2, 200);
+
+insert into tally (id, val) values (3, 150)
+   returning id, (select count(*) from tally where val > 150) as higher_count;
+→ [{"id":3,"higher_count":1}]
+
+select count(*) as cnt from tally;
+→ [{"cnt":3}]
+
+drop table tally;
+
+-- ===================================
+-- 2. INSERT ... SELECT with RETURNING (multi-row)
+-- ===================================
+
+create table src_xfer (id integer primary key, val integer);
+create table dst_xfer (id integer primary key, val integer);
+insert into src_xfer values (1, 100), (2, 200), (3, 300);
+
+insert into dst_xfer select id, val from src_xfer returning id, val;
+→ [{"id":1,"val":100},{"id":2,"val":200},{"id":3,"val":300}]
+
+select id, val from dst_xfer order by id;
+→ [{"id":1,"val":100},{"id":2,"val":200},{"id":3,"val":300}]
+
+drop table dst_xfer;
+drop table src_xfer;
+
+-- ===================================
+-- 3. RETURNING with quoted identifier and bracket-quoted column
+-- ===================================
+
+create table quoted_cols (id integer primary key, "Name" text);
+insert into quoted_cols values (1, 'first') returning id, "Name" as name_out;
+→ [{"id":1,"name_out":"first"}]
+
+-- bracket-quoted identifier [Name] in RETURNING projection preserves case
+insert into quoted_cols values (2, 'second') returning id, [Name];
+→ [{"id":2,"Name":"second"}]
+
+drop table quoted_cols;
+
+-- ===================================
+-- 4. RETURNING on no-op UPSERT (DO NOTHING) returns no row
+-- ===================================
+
+create table noop (id integer primary key, val text);
+insert into noop values (1, 'a');
+
+insert into noop values (1, 'b') on conflict do nothing returning id, val;
+→ []
+
+-- existing row unchanged
+select id, val from noop;
+→ [{"id":1,"val":"a"}]
+
+drop table noop;
+
+-- ===================================
+-- 5. RETURNING on INSERT with computed expression and aggregate-style call
+-- ===================================
+
+create table greet (id integer primary key, name text);
+
+insert into greet values (1, 'world')
+   returning id, 'hello, ' || name as msg, length(name) as n;
+→ [{"id":1,"msg":"hello, world","n":5}]
+
+drop table greet;
+
+-- ===================================
+-- 6. RETURNING from generated-column table omits / includes generated col
+-- ===================================
+
+create table gen_t (id integer primary key, name text, display text generated always as (upper(name)));
+
+-- baseline: stored columns return
+insert into gen_t (id, name) values (1, 'alice') returning id, name;
+→ [{"id":1,"name":"alice"}]
+
+-- generated column referenced in RETURNING projection
+insert into gen_t (id, name) values (2, 'bob') returning id, name, display;
+→ [{"id":2,"name":"bob","display":"BOB"}]
+
+drop table gen_t;
+
+-- ===================================
+-- 7. UPDATE OR <action> is intentionally not supported
+-- ===================================
+-- Per-statement conflict overrides on UPDATE are SQLite-only syntax; pinned closed.
+-- See docs/sql.md §11.
+
+create table or_ig (id integer primary key, code text unique);
+insert into or_ig values (1, 'x'), (2, 'y');
+
+update or ignore or_ig set code = 'x' where id = 2 returning id, code;
+-- error: Expected table name
+
+drop table or_ig;
+
+-- ===================================
+-- 8. RETURNING with two scalar subqueries that share a plan subtree.
+-- (Regression: shared-subtree row-context collision under store mode —
+-- see ticket serialize-emit-callbacks-returning-window. The cache rule
+-- deduplicates the two textually-identical derived tables, so both
+-- subqueries iterate the same inner scan; without serialized
+-- evaluation they raced on the shared RowSlot under LevelDB.)
+-- ===================================
+
+create table tr (id integer primary key, v integer);
+insert into tr values (1, 10), (2, 20), (3, 30);
+
+insert into tr values (4, 40)
+returning
+  (select count(*) from (select * from tr where v >= 20) sub1) as count,
+  (select sum(v) from (select * from tr where v >= 20) sub2) as sum;
+→ [{"count":3,"sum":90}]
+
+drop table tr;
+
+-- ===================================
+-- 9. RETURNING * / table.* on a base-table INSERT / UPDATE / DELETE
+-- ===================================
+-- `*` expands to every target column in declaration order; the unqualified
+-- symbols bind the statement's default image (NEW for INSERT/UPDATE, OLD for
+-- DELETE). Output names are the bare column names regardless of qualifier.
+
+create table star_t (id integer primary key, name text, value integer default 100);
+
+-- INSERT ... RETURNING * → full row, declaration order; DEFAULT 100 surfaced.
+insert into star_t (id, name) values (1, 'a') returning *;
+→ [{"id":1,"name":"a","value":100}]
+
+-- INSERT ... RETURNING table.* (qualified by the target table name) → same as *.
+insert into star_t (id, name, value) values (2, 'b', 200) returning star_t.*;
+→ [{"id":2,"name":"b","value":200}]
+
+-- a wrong qualifier errors (not a generic crash, not a silent expand).
+insert into star_t (id, name) values (3, 'c') returning bogus.*;
+-- error: not found
+
+-- the rejected insert made no row (id=3 absent).
+select id from star_t order by id;
+→ [{"id":1},{"id":2}]
+
+-- UPDATE ... RETURNING * → the NEW (post-update) image, full row.
+update star_t set value = 101 where id = 1 returning *;
+→ [{"id":1,"name":"a","value":101}]
+
+-- mixed projection, trailing: * expands in place, the extra `name` keeps its
+-- position and is de-duplicated to `name:1`.
+update star_t set value = 102 where id = 1 returning *, name;
+→ [{"id":1,"name":"a","value":102,"name:1":"a"}]
+
+-- mixed projection, leading: a column before * keeps position (the star copy of
+-- `id` de-duplicates to `id:1`).
+update star_t set value = 103 where id = 1 returning id, *;
+→ [{"id":1,"id:1":1,"name":"a","value":103}]
+
+-- OLD-qualified expression composes with * (which is the NEW image).
+update star_t set value = 200 where id = 1 returning old.value, *;
+→ [{"old.value":103,"id":1,"name":"a","value":200}]
+
+-- DELETE ... RETURNING * → the OLD (deleted) image, full row.
+delete from star_t where id = 2 returning *;
+→ [{"id":2,"name":"b","value":200}]
+
+-- zero-row mutations with * yield an empty result set, not an error.
+update star_t set value = 0 where 1 = 0 returning *;
+→ []
+
+delete from star_t where 1 = 0 returning *;
+→ []
+
+-- relational orthogonality: RETURNING * makes the DML a relation usable in CTE
+-- position (a wider projection). Insert form:
+with ins as (insert into star_t (id, name, value) values (5, 'e', 50) returning *)
+select count(*) as c from ins;
+→ [{"c":1}]
+
+-- ...and delete form.
+with d as (delete from star_t where id = 5 returning *)
+select id, name, value from d;
+→ [{"id":5,"name":"e","value":50}]
+
+-- interaction: a multi-row INSERT ... RETURNING * emits one expanded row per
+-- inserted row (the star is the projection list; the executor supplies the rows).
+insert into star_t (id, name, value) values (10, 'j', 1), (11, 'k', 2) returning *;
+→ [{"id":10,"name":"j","value":1},{"id":11,"name":"k","value":2}]
+
+-- ...and a multi-row UPDATE ... RETURNING * emits one NEW image per updated row.
+update star_t set value = value + 100 where id in (10, 11) returning *;
+→ [{"id":10,"name":"j","value":101},{"id":11,"name":"k","value":102}]
+
+drop table star_t;
+
+-- ===================================
+-- 10. RETURNING * surfaces resolved DEFAULT and generated-column values
+-- ===================================
+
+create table gstar (id integer primary key, name text, qty integer default 7,
+    display text generated always as (upper(name)));
+
+insert into gstar (id, name) values (1, 'alice') returning *;
+→ [{"id":1,"name":"alice","qty":7,"display":"ALICE"}]
+
+drop table gstar;
+
+-- ===================================
+-- 11. RETURNING * over a collated column round-trips the stored value, and the
+--     column's declared collation still drives the WHERE match (the * column
+--     resolves through the same symbol a named column would).
+-- ===================================
+
+create table cstar (id integer primary key, name text collate nocase);
+insert into cstar values (1, 'Hello'), (2, 'WORLD');
+
+-- nocase WHERE matches 'hello' → 'Hello'; * returns the verbatim stored value.
+update cstar set name = name where name = 'hello' returning *;
+→ [{"id":1,"name":"Hello"}]
+
+drop table cstar;

@@ -1,11 +1,33 @@
 import type { Row, SqlValue } from '../common/types.js';
 import { createLogger } from '../common/logger.js';
+import type { AnyVirtualTableModule } from './module.js';
 
 const log = createLogger('vtab:events');
 const errorLog = log.extend('error');
 
 /**
+ * Attempt to extract a {@link VTableEventEmitter} from a virtual-table module.
+ * Returns `undefined` when the module does not expose `getEventEmitter()` or
+ * the returned object does not provide at least one of `onDataChange` /
+ * `onSchemaChange`. Used by both the database-level event hooking path and
+ * the public {@link Table} handle.
+ */
+export function tryGetEventEmitter(module: AnyVirtualTableModule): VTableEventEmitter | undefined {
+	const asSource = module as { getEventEmitter?: () => unknown };
+	if (typeof asSource.getEventEmitter !== 'function') return undefined;
+	const emitter = asSource.getEventEmitter();
+	if (!emitter || typeof emitter !== 'object') return undefined;
+	const typed = emitter as { onDataChange?: unknown; onSchemaChange?: unknown };
+	if (typeof typed.onDataChange !== 'function' && typeof typed.onSchemaChange !== 'function') return undefined;
+	return emitter as VTableEventEmitter;
+}
+
+/**
  * Data change event emitted when mutations are committed.
+ *
+ * Producers owe the key contract in `docs/usage.md` § Subscribing to Data Changes: `key` is
+ * projected from the event's own row image, and an `update` never moves a row (a relocating
+ * primary-key change is a `delete` at the old key then an `insert` at the new one).
  */
 export interface VTableDataChangeEvent {
 	/** The type of mutation operation */
@@ -14,7 +36,7 @@ export interface VTableDataChangeEvent {
 	schemaName: string;
 	/** Table name */
 	tableName: string;
-	/** Primary key values */
+	/** Primary key projected from this event's own image: `newRow` for insert/update, `oldRow` for delete */
 	key?: SqlValue[];
 	/** Previous row data (for update/delete) */
 	oldRow?: Row;
@@ -38,6 +60,9 @@ export interface VTableSchemaChangeEvent {
 	schemaName: string;
 	/** Object name (table name for table/column, index name for index) */
 	objectName: string;
+	/** Old object name — `RENAME TO` only: the table name before the rename
+	 *  (`objectName` carries the new one). Companion to `oldColumnName`. */
+	oldObjectName?: string;
 	/** Column name (for column operations) */
 	columnName?: string;
 	/** Old column name (for column rename) */
